@@ -1,0 +1,34 @@
+import os
+
+
+def get_folder_size(folder_path):
+    """计算文件夹的总大小（字节）"""
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(folder_path):
+        for filename in filenames:
+            filepath = os.path.join(dirpath, filename)
+            try:
+                total_size += os.path.getsize(filepath)
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                print(f"Warning: Skipping {filepath} due to error - {e}")
+    return total_size
+
+
+def format_size(size_bytes):
+    """将字节转换为人类可读格式（KB/MB/GB/TB）"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+
+
+if __name__ == "__main__":
+    folder_path = "/rjxy/t0b/teacher04/lh/deephash_original"
+
+    if not os.path.exists(folder_path):
+        print(f"Error: Folder not found - {folder_path}")
+        exit(1)
+
+    print(f"Calculating size of: {folder_path}...")
+    size_bytes = get_folder_size(folder_path)
+    print(f"Total size: {format_size(size_bytes)}")

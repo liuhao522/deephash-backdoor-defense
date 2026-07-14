@@ -1,0 +1,59 @@
+# 数据集 (几十GB)
+data/
+dataset/
+
+# 模型权重 (GB级别)
+save/
+log/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+
+# 旧环境
+venv/
+
+# 压缩包
+*.tar.gz
+*.zip
+*.7z
+
+# 临时脚本
+1.py
+2.py
+5.py
+6.py
+a.py
+fuzhi.py
+test.py
+demo.py
+
+# 无关项目
+b_c/
+
+# Excel (数据文件)
+*.xlsx
+*.xls
+
+# 模型文件
+*.pth
+*.pt
+*.ckpt
+
+# 日志
+*.log
+
+# 图片 (触发器素材等)
+*.png
+*.jpg
+*.jpeg
+
+# VS Code
+.vscode/
+
+# 无关代码
+backdoor defense.py
+backdoor defense2.py
+backdoor defense3.py
