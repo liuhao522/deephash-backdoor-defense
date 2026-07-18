@@ -9,9 +9,9 @@ from torchvision import transforms
 import cv2
 
 # 文件路径配置
-train_excel_path = r"D:/deephash_original/data/GTSRB/train.xlsx"
-source_image_dir = r"D:/deephash_original/dataset/GTSRB/images/"
-output_image_dir = r"D:/deephash_original/dataset/GTSRB/images_blended/"
+train_excel_path = r"D:/deephash_original/data/CIFAR10/train.xlsx"
+source_image_dir = r"D:/deephash_original/dataset/CIFAR10/images/"
+output_image_dir = r"D:/deephash_original/dataset/CIFAR10/images_blended/"
 mask_path = r"D:/deephash_original/dataset/MNIST/hello_kitty.jpeg"
 
 # 创建输出目录
