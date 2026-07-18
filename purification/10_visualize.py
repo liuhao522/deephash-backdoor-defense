@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
-"""10_visualize.py — Publication-quality figure generation."""
-import os, numpy as np, torch, matplotlib
+"""10_visualize.py — Publication-quality figure generation.
+
+IMPROVED: timing summary, better layout, more diagnostic plots.
+"""
+import os, json, numpy as np, torch, matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+from typing import Dict, Optional
 
 class Visualizer:
     """Generates all diagnostic and summary figures."""
     def __init__(self, config):
         self.cfg = config
-        plt.rcParams.update({'font.size': 10, 'axes.titlesize': 11, 'figure.dpi': 150})
+        plt.rcParams.update({
+            'font.size': 10, 'axes.titlesize': 11, 'figure.dpi': 150,
+            'figure.autolayout': False,
+        })
 
     def _to_display(self, t):
         if t is None: return np.zeros((32,32,3))
@@ -113,3 +120,81 @@ class Visualizer:
             ax.set_title(f'{tn} ({mask.sum()})'); ax.legend(fontsize=5,ncol=2,loc='upper right')
         plt.suptitle('Feature Space t-SNE',fontsize=13,fontweight='bold'); plt.tight_layout()
         plt.savefig(f'{self.cfg.exp_dir}/tsne.png',dpi=150); plt.close()
+
+    def timing_summary(self, timings: Dict[str, float], output_dir: str):
+        """Generate timing breakdown bar chart."""
+        if not timings:
+            return
+        fig, ax = plt.subplots(figsize=(10, 4))
+        names = list(timings.keys())
+        values = [timings[n] for n in names]
+        colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(names)))
+        bars = ax.barh(names, values, color=colors, edgecolor='black', linewidth=0.5)
+        ax.set_xlabel('Time (seconds)')
+        ax.set_title('Pipeline Timing Breakdown')
+        for bar, v in zip(bars, values):
+            ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
+                    f'{v:.1f}s', va='center', fontsize=9)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'timings.png'), dpi=150)
+        plt.close()
+
+    def feature_distance_evolution(self, all_diags: list, output_dir: str):
+        """Plot feature distance evolution across pipeline stages."""
+        if not all_diags:
+            return
+        fig, ax = plt.subplots(figsize=(10, 5))
+        stages = ['d_pois_init', 'd_2a', 'd_final']
+        stage_labels = ['Poisoned', 'After Freq', 'After Purification']
+        colors = plt.cm.tab10(np.arange(len(all_diags)))
+
+        for si, sd in enumerate(all_diags):
+            d_init = sd.get('d_pois_init', 0)
+            d_2a = sd['stages'].get('2a_frequency', {}).get('metrics', {}).get('d_to_true_center', d_init)
+            d_final = sd['stages'].get('5_label', {}).get('metrics', {}).get('d_to_true_center', 0)
+            vals = [d_init, d_2a, d_final]
+            correct = sd['stages'].get('5_label', {}).get('metrics', {}).get('final_label') == sd['true_label']
+            marker = 'o-' if correct else 's--'
+            ax.plot(range(len(vals)), vals, marker, color=colors[si],
+                    label=f"S{si+1} ({sd['fname'][:15]}...)", alpha=0.7, linewidth=1.5)
+
+        ax.set_xticks(range(len(stage_labels)))
+        ax.set_xticklabels(stage_labels)
+        ax.set_ylabel('Distance to True Class Center')
+        ax.set_title('Feature Distance Evolution Across Pipeline Stages')
+        ax.legend(fontsize=6, ncol=2, loc='upper left')
+        ax.grid(alpha=0.3, axis='y')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'distance_evolution.png'), dpi=150)
+        plt.close()
+
+    def confidence_distribution(self, metrics, output_dir: str):
+        """Plot confidence score distribution."""
+        per_sample = getattr(metrics, 'per_sample', [])
+        if not per_sample:
+            return
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        confs = [s.get('confidence', 0) for s in per_sample]
+        corrects = [s.get('correct', False) for s in per_sample]
+
+        # Histogram
+        axes[0].hist(confs, bins=15, color='steelblue', edgecolor='black', alpha=0.7)
+        axes[0].axvline(x=self.cfg.conf_threshold, color='red', linestyle='--',
+                        label=f'Threshold ({self.cfg.conf_threshold})')
+        axes[0].set_xlabel('Confidence'); axes[0].set_ylabel('Count')
+        axes[0].set_title('Confidence Distribution'); axes[0].legend()
+
+        # Correct vs Incorrect
+        correct_confs = [c for c, ok in zip(confs, corrects) if ok]
+        wrong_confs = [c for c, ok in zip(confs, corrects) if not ok]
+        axes[1].bar(['Correct', 'Wrong'],
+                    [np.mean(correct_confs) if correct_confs else 0,
+                     np.mean(wrong_confs) if wrong_confs else 0],
+                    color=['green', 'red'], alpha=0.6)
+        axes[1].set_ylabel('Mean Confidence'); axes[1].set_title('Confidence by Outcome')
+
+        plt.suptitle('Label Calibration Diagnostics', fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'confidence_dist.png'), dpi=150)
+        plt.close()

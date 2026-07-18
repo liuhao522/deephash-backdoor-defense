@@ -1,26 +1,38 @@
 # -*- coding: utf-8 -*-
-"""11_pipeline.py — Main orchestration class. Ties all modules together."""
-import os, sys, numpy as np, pandas as pd
+"""11_pipeline.py — Main orchestration class. Ties all modules together.
+
+COMPREHENSIVE REWRITE. Changes:
+  - Clean model accuracy verification (not just "cached" trust)
+  - Per-module diagnostics and timing
+  - LPIPS resize fix propagated
+  - All new module APIs integrated
+  - Better error handling and logging
+  - Purified model training for proper evaluation
+"""
+import os, sys, time, numpy as np, pandas as pd
 from PIL import Image
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms, datasets
+import copy
 
-# Add parent to path so imports work from this directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import importlib
+
+
 def _imp(name):
     return importlib.import_module(name)
+
 
 PipelineConfig = _imp('01_config').PipelineConfig
 FeatureExtractor = _imp('02_models').FeatureExtractor
 ResNet18Extractor = _imp('02_models').ResNet18Extractor
 MobileNetV3Extractor = _imp('02_models').MobileNetV3Extractor
+get_extractor = _imp('02_models').get_extractor
 PatchGAN = _imp('02_models').PatchGAN
 MetricsTracker = _imp('04_metrics').MetricsTracker
 Evaluator = _imp('04_metrics').Evaluator
@@ -34,283 +46,725 @@ import lpips
 
 
 class PurificationPipeline:
-    """Complete purification pipeline orchestrator."""
+    """Complete purification pipeline orchestrator (rewritten)."""
 
     def __init__(self, config: PipelineConfig):
         self.cfg = config
-        self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device(
+            config.device if torch.cuda.is_available() else 'cpu')
         self.rng = np.random.RandomState(config.seed)
-        torch.manual_seed(config.seed); np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        np.random.seed(config.seed)
 
-        self.mean_t = torch.tensor(config.mean).view(config.img_channels,1,1).to(self.device)
-        self.std_t = torch.tensor(config.std).view(config.img_channels,1,1).to(self.device)
+        # Denorm tensors
+        self.mean_t = torch.tensor(config.mean).view(
+            config.img_channels, 1, 1).to(self.device)
+        self.std_t = torch.tensor(config.std).view(
+            config.img_channels, 1, 1).to(self.device)
 
+        # Image transform (normalized)
         self.img_transform = transforms.Compose([
-            transforms.ToTensor(), transforms.Normalize(config.mean, config.std)
+            transforms.ToTensor(),
+            transforms.Normalize(config.mean, config.std)
         ])
 
-        self.poisoned_model: Optional[FeatureExtractor] = None
+        # Image transform (unnormalized, for PatchGAN)
+        self.img_transform_raw = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+        # State
+        self.clean_model: Optional[nn.Module] = None
+        self.poisoned_model: Optional[nn.Module] = None
         self.patchgan: Optional[PatchGAN] = None
         self.freq_filter: Optional[FrequencyFilter] = None
+        self.grad_gen: Optional[GradientMaskGenerator] = None
         self.centers: Optional[np.ndarray] = None
         self.metrics = MetricsTracker()
         self.data: Dict = {}
         self.results: Dict = {}
+        self.timings: Dict[str, float] = {}
 
-    # ===== DATA LOADING =====
+        # Per-module flags
+        self._clean_model_trained = False
+
+    # ================================================================
+    # DATA LOADING
+    # ================================================================
     def load_data(self):
-        print("\n" + "="*60 + "\n[1] DATA LOADING\n" + "="*60)
+        t0 = time.time()
+        print("\n" + "=" * 60 + "\n[1] DATA LOADING\n" + "=" * 60)
+
         df = pd.read_excel(self.cfg.excel_path, header=None)
         label_map = {}
         clean_f, clean_l = [], []
         pois_f, pois_l = [], []
 
+        skipped = 0
         for i in range(1, len(df)):
-            fname = df.iloc[i,0]; ml = int(df.iloc[i,1])
+            fname = df.iloc[i, 0]
+            ml = int(df.iloc[i, 1])
             tl = self._extract_label(fname)
-            if tl is None: continue
+            if tl is None:
+                skipped += 1
+                continue
             label_map[fname] = ml
-            if tl == ml: clean_f.append(fname); clean_l.append(tl)
-            else: pois_f.append(fname); pois_l.append(tl)
+            if tl == ml:
+                clean_f.append(fname)
+                clean_l.append(tl)
+            else:
+                pois_f.append(fname)
+                pois_l.append(tl)
 
+        # Select balanced clean subset for clustering
         sel_cf, sel_cl = [], []
         for label in range(self.cfg.num_classes):
-            pool = [(f,l) for f,l in zip(clean_f, clean_l) if l == label]
+            pool = [(f, l) for f, l in zip(clean_f, clean_l) if l == label]
             n = min(self.cfg.n_clean_per_class, len(pool))
-            for idx in self.rng.choice(len(pool), n, replace=False):
-                sel_cf.append(pool[idx][0]); sel_cl.append(label)
+            if n > 0:
+                for idx in self.rng.choice(len(pool), n, replace=False):
+                    sel_cf.append(pool[idx][0])
+                    sel_cl.append(label)
 
+        # Select poisoned subset for purification
         n_p = min(self.cfg.n_poisoned_total, len(pois_f))
-        p_idx = self.rng.choice(len(pois_f), n_p, replace=False)
-        pf_sub = [pois_f[i] for i in p_idx]; pl_sub = [pois_l[i] for i in p_idx]
+        if n_p > 0:
+            p_idx = self.rng.choice(len(pois_f), n_p, replace=False)
+            pf_sub = [pois_f[i] for i in p_idx]
+            pl_sub = [pois_l[i] for i in p_idx]
+        else:
+            pf_sub, pl_sub = [], []
 
-        print(f"  Clean: {len(clean_f)}, Poisoned: {len(pois_f)}")
+        print(f"  Clean: {len(clean_f)}, Poisoned: {len(pois_f)}, Skipped: {skipped}")
         print(f"  Cluster: {len(sel_cf)}, Purify targets: {len(pf_sub)}")
+        print(f"  Clean label dist: {pd.Series(clean_l).value_counts().to_dict()}")
+        print(f"  Poison label dist: {pd.Series(pois_l).value_counts().to_dict()}")
 
-        self.data = {'clean_files': clean_f, 'clean_labels': clean_l,
-                     'poison_files': pois_f, 'poison_labels': pois_l,
-                     'sel_clean_f': sel_cf, 'sel_clean_l': sel_cl,
-                     'pois_f_sub': pf_sub, 'pois_l_sub': pl_sub, 'label_map': label_map}
+        self.data = {
+            'clean_files': clean_f, 'clean_labels': clean_l,
+            'poison_files': pois_f, 'poison_labels': pois_l,
+            'sel_clean_f': sel_cf, 'sel_clean_l': sel_cl,
+            'pois_f_sub': pf_sub, 'pois_l_sub': pl_sub,
+            'label_map': label_map,
+        }
+        self.timings['load_data'] = time.time() - t0
         return self
 
-    # ===== TWO-MODEL TRAINING =====
+    # ================================================================
+    # MODEL FACTORY
+    # ================================================================
     def _get_model_cls(self):
         backbone = getattr(self.cfg, 'backbone', 'mobilenet')
-        if backbone == 'resnet18': return ResNet18Extractor
-        elif backbone == 'cnn': return FeatureExtractor
+        if backbone == 'resnet18':
+            return ResNet18Extractor
+        elif backbone == 'cnn':
+            return FeatureExtractor
         return MobileNetV3Extractor
 
-    def _train_model(self, model, loader, epochs, desc=''):
-        opt = optim.Adam(model.parameters(), lr=0.001)
-        sch = optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.5)
-        for ep in range(epochs):
-            model.train()
-            for x, y in loader:
-                x,y=x.to(self.device),y.to(self.device)
-                opt.zero_grad(); nn.CrossEntropyLoss()(model(x),y).backward(); opt.step()
-            sch.step()
-        model.eval()
+    def _build_model(self) -> nn.Module:
+        """Build a fresh model instance."""
+        model_cls = self._get_model_cls()
+        return model_cls(self.cfg.num_classes, self.cfg.feat_dim).to(self.device)
 
+    # ================================================================
+    # CLEAN MODEL TRAINING
+    # ================================================================
     def train_clean_model(self):
-        """Train feature extractor on CLEAN CIFAR-10 (torchvision)."""
+        """Train feature extractor on CLEAN CIFAR-10. Cached to disk with sanity check."""
+        t0 = time.time()
+        cache_path = os.path.join(self.cfg.output_root, 'clean_model.pth')
+        model_cls = self._get_model_cls()
+
+        # Try loading cached model
+        if os.path.exists(cache_path):
+            print(f"\n[2] Loading cached clean model: {cache_path}")
+            self.clean_model = model_cls(
+                self.cfg.num_classes, self.cfg.feat_dim).to(self.device)
+            self.clean_model.load_state_dict(
+                torch.load(cache_path, map_location=self.device))
+            self.clean_model.eval()
+
+            # VERIFY the cached model actually works
+            backbone = getattr(self.cfg, 'backbone', 'mobilenet')
+            if backbone in ('resnet18', 'mobilenet'):
+                verify_tf = transforms.Compose([
+                    transforms.Resize(224), transforms.ToTensor(),
+                    transforms.Normalize(self.cfg.mean, self.cfg.std)
+                ])
+            else:
+                verify_tf = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize(self.cfg.mean, self.cfg.std)
+                ])
+            test_ds = datasets.CIFAR10(root='./data', train=False, download=True,
+                                       transform=verify_tf)
+            test_ldr = DataLoader(test_ds, batch_size=self.cfg.batch_size, shuffle=False)
+            ca = self._eval_acc(self.clean_model, test_ldr)
+            self.metrics.set('clean_model_test_acc', ca)
+            print(f"  Cached clean model verified: test accuracy = {ca:.1f}%")
+
+            if ca < 60.0:
+                print(f"  ⚠ WARNING: Clean model accuracy {ca:.1f}% is LOW. "
+                      f"Class centers may be unreliable. Consider retraining.")
+                print(f"  Deleting cache and retraining...")
+                os.remove(cache_path)
+            else:
+                self._clean_model_trained = True
+                self.timings['train_clean_model'] = time.time() - t0
+                return self
+
+        # Train from scratch
         print("\n[2] Training CLEAN feature extractor on CIFAR-10...")
-        clean_train = datasets.CIFAR10(root='./data', train=True, download=True,
-            transform=transforms.Compose([
-                transforms.Resize(224), transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(), transforms.Normalize(self.cfg.mean, self.cfg.std)
-            ]))
-        clean_test = datasets.CIFAR10(root='./data', train=False, download=True,
-            transform=transforms.Compose([
-                transforms.Resize(224), transforms.ToTensor(),
+        epochs = getattr(self.cfg, 'model_epochs_clean', 25)
+
+        # MobileNetV3/ResNet18 need 224×224; CNN works on 32×32
+        backbone = getattr(self.cfg, 'backbone', 'mobilenet')
+        if backbone in ('resnet18', 'mobilenet'):
+            # ImageNet-scale backbones: resize 32→224, NO RandomCrop on 224!
+            train_tf = transforms.Compose([
+                transforms.Resize(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
                 transforms.Normalize(self.cfg.mean, self.cfg.std)
-            ]))
+            ])
+            test_tf = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(self.cfg.mean, self.cfg.std)
+            ])
+        else:
+            # CNN backbone: native 32×32 with standard CIFAR-10 augmentation
+            train_tf = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(self.cfg.mean, self.cfg.std)
+            ])
+            test_tf = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(self.cfg.mean, self.cfg.std)
+            ])
+
+        clean_train = datasets.CIFAR10(root='./data', train=True, download=True,
+                                       transform=train_tf)
+        clean_test = datasets.CIFAR10(root='./data', train=False, download=True,
+                                      transform=test_tf)
+
         train_ldr = DataLoader(clean_train, batch_size=self.cfg.batch_size, shuffle=True)
         test_ldr = DataLoader(clean_test, batch_size=self.cfg.batch_size, shuffle=False)
 
-        model_cls = self._get_model_cls()
-        self.clean_model = model_cls(self.cfg.num_classes, self.cfg.feat_dim).to(self.device)
-        self._train_model(self.clean_model, train_ldr, self.cfg.model_epochs)
+        self.clean_model = model_cls(
+            self.cfg.num_classes, self.cfg.feat_dim).to(self.device)
+        self._train_model(self.clean_model, train_ldr, epochs, desc='clean')
 
-        # Test accuracy
-        correct, total = 0, 0
-        with torch.no_grad():
-            for x, y in test_ldr:
-                x,y=x.to(self.device),y.to(self.device)
-                correct += (self.clean_model(x).argmax(1)==y).sum().item()
-                total += y.size(0)
-        clean_acc = 100*correct/total
-        self.metrics.set('clean_model_test_acc', clean_acc)
-        print(f"  Clean model test accuracy: {clean_acc:.1f}%")
+        ca = self._eval_acc(self.clean_model, test_ldr)
+        self.metrics.set('clean_model_test_acc', ca)
+        print(f"  Clean model test accuracy: {ca:.1f}%")
+
+        if ca < 60.0:
+            print(f"  ⚠ WARNING: Clean model accuracy {ca:.1f}% is LOW!")
+
+        torch.save(self.clean_model.state_dict(), cache_path)
+        print(f"  Saved: {cache_path}")
+        self._clean_model_trained = True
+        self.timings['train_clean_model'] = time.time() - t0
         return self
 
+    # ================================================================
+    # POISONED MODEL TRAINING
+    # ================================================================
     def train_poisoned_model(self):
-        """Train separate poisoned model for gradient computation only."""
+        """Train poisoned model for gradient mask computation.
+
+        Uses a FRESH model instance — does not share weights with clean model.
+        """
+        t0 = time.time()
         print("\n[3] Training POISONED model (for gradient mask only)...")
-        all_f = [f for f in os.listdir(self.cfg.pois_dir) if f.endswith('.png') and f in self.data['label_map']]
+
+        all_f = [f for f in os.listdir(self.cfg.pois_dir)
+                 if f.endswith('.png') and f in self.data['label_map']]
 
         class _DS(Dataset):
             def __init__(s, fl, d, t, lm):
-                s.fl=fl; s.d=d; s.t=t; s.lm=lm
+                s.fl = fl; s.d = d; s.t = t; s.lm = lm
             def __len__(s): return len(s.fl)
             def __getitem__(s, i):
-                f=s.fl[i]; img=s.t(Image.open(os.path.join(s.d,f)).convert('RGB'))
+                f = s.fl[i]
+                img = s.t(Image.open(os.path.join(s.d, f)).convert('RGB'))
                 return img, s.lm[f]
 
-        ds = _DS(all_f, self.cfg.pois_dir, self.img_transform, self.data['label_map'])
+        ds = _DS(all_f, self.cfg.pois_dir, self.img_transform,
+                 self.data['label_map'])
         loader = DataLoader(ds, batch_size=self.cfg.batch_size, shuffle=True)
 
+        # Build FRESH model
+        epochs = getattr(self.cfg, 'model_epochs_poisoned', 15)
         model_cls = self._get_model_cls()
-        self.poisoned_model = model_cls(self.cfg.num_classes, self.cfg.feat_dim).to(self.device)
-        self._train_model(self.poisoned_model, loader, self.cfg.model_epochs)
+        self.poisoned_model = model_cls(
+            self.cfg.num_classes, self.cfg.feat_dim).to(self.device)
+        self._train_model(self.poisoned_model, loader, epochs, desc='poisoned')
 
-        asr = Evaluator.asr(self.poisoned_model,
+        # Measure ASR
+        asr = Evaluator.asr(
+            self.poisoned_model,
             list(zip(self.data['poison_files'], self.data['poison_labels'])),
-            self.cfg.pois_dir, self.cfg.target_class, self.img_transform, self.device)
+            self.cfg.pois_dir, self.cfg.target_class,
+            self.img_transform, self.device)
         self.metrics.set('ASR_original', asr)
         print(f"  ASR: {asr:.1f}%")
+
+        self.timings['train_poisoned_model'] = time.time() - t0
         return self
 
+    # ================================================================
+    # PatchGAN TRAINING
+    # ================================================================
     def train_patchgan(self):
-        print("[3] Training PatchGAN...")
-        self.patchgan = PatchGAN(self.cfg.img_channels).to(self.device)
-        opt = optim.Adam(self.patchgan.parameters(), lr=0.0002, betas=(0.5,0.999))
+        """Train PatchGAN to discriminate clean vs poisoned images.
+
+        BUGFIX #4: Now uses REAL poisoned images as fake samples (not just
+        Gaussian noise). This teaches PatchGAN what a trigger looks like,
+        so adv_loss during purification pushes AWAY from trigger patterns.
+        """
+        t0 = time.time()
+        print("[4] Training PatchGAN (clean vs poisoned discrimination)...")
+
+        self.patchgan = PatchGAN(
+            self.cfg.img_channels, use_sn=True
+        ).to(self.device)
+
+        opt = optim.Adam(self.patchgan.parameters(),
+                         lr=self.cfg.patchgan_lr, betas=(0.5, 0.999))
         loss_fn = nn.BCEWithLogitsLoss()
+
         cf = self.data['sel_clean_f']
+        pf = self.data['pois_f_sub']  # REAL poisoned images!
+
+        real_target = 0.9
+        fake_target = 0.0
 
         for ep in range(self.cfg.patchgan_epochs):
             self.rng.shuffle(cf)
-            for s in range(0, len(cf), 64):
-                bf = cf[s:s+64]
-                real = torch.stack([transforms.ToTensor()(Image.open(os.path.join(self.cfg.clean_dir,f)).convert('RGB')) for f in bf]).to(self.device)
-                fake = (real + 0.1*torch.randn_like(real)).clamp(0,1)
+            ep_loss = 0.0
+            n_batches = 0
+
+            for s in range(0, len(cf), 32):
+                bf_clean = cf[s:s + 32]
+                if len(bf_clean) == 0:
+                    continue
+
+                # Real: clean images
+                real_imgs = []
+                for fn in bf_clean:
+                    img = Image.open(os.path.join(
+                        self.cfg.clean_dir, fn)).convert('RGB')
+                    real_imgs.append(transforms.ToTensor()(img))
+                real = torch.stack(real_imgs).to(self.device)
+
+                # Fake: mix of REAL poisoned images + Gaussian noise
+                n_poison = min(len(bf_clean), len(pf))
+                fake_imgs = []
+                if n_poison > 0:
+                    # Sample poisoned images
+                    p_idx = self.rng.choice(len(pf), n_poison, replace=False)
+                    for pi in p_idx:
+                        pimg = Image.open(os.path.join(
+                            self.cfg.pois_dir, pf[pi])).convert('RGB')
+                        fake_imgs.append(transforms.ToTensor()(pimg))
+
+                # If not enough poisoned, add noisy versions too
+                while len(fake_imgs) < len(real_imgs):
+                    noise_img = real_imgs[len(fake_imgs) % len(real_imgs)] + \
+                                0.08 * torch.randn_like(real_imgs[0])
+                    fake_imgs.append(noise_img.clamp(0, 1))
+
+                fake = torch.stack(fake_imgs[:len(real_imgs)]).to(self.device)
+
                 opt.zero_grad()
-                l = loss_fn(self.patchgan(real), torch.ones_like(self.patchgan(real))) + loss_fn(self.patchgan(fake.detach()), torch.zeros_like(self.patchgan(fake)))
-                l.backward(); opt.step()
-        self.patchgan.eval(); print("  Ready.")
+                pred_real = self.patchgan(real)
+                pred_fake = self.patchgan(fake.detach())
+
+                l = (loss_fn(pred_real, torch.full_like(pred_real, real_target)) +
+                     loss_fn(pred_fake, torch.full_like(pred_fake, fake_target)))
+                l.backward()
+                opt.step()
+                ep_loss += l.item()
+                n_batches += 1
+
+            if (ep + 1) % max(1, self.cfg.patchgan_epochs // 5) == 0:
+                print(f"    PatchGAN epoch {ep+1}/{self.cfg.patchgan_epochs}, "
+                      f"loss={ep_loss/max(1,n_batches):.4f}")
+
+        self.patchgan.eval()
+        print("  PatchGAN ready (trained on clean vs REAL poisoned).")
+        self.timings['train_patchgan'] = time.time() - t0
         return self
 
-    # ===== CLASS CENTERS =====
+    # ================================================================
+    # CLASS CENTERS
+    # ================================================================
     def build_centers(self):
-        print("[4] Building class centers (clean model features)...")
-        model = self.clean_model  # use CLEAN model for cluster centers!
-        feats = self._batch_extract(self.data['sel_clean_f'], self.cfg.clean_dir, model=model)
+        t0 = time.time()
+        print("[5] Building class centers (clean model features)...")
+
+        feats = self._batch_extract(
+            self.data['sel_clean_f'], self.cfg.clean_dir, model=self.clean_model)
         class_feats = defaultdict(list)
-        for feat, label in zip(feats, self.data['sel_clean_l']): class_feats[label].append(feat)
+        for feat, label in zip(feats, self.data['sel_clean_l']):
+            class_feats[label].append(feat)
 
         self.centers = np.zeros((self.cfg.num_classes, self.cfg.feat_dim))
+        intra_stds = []
         for label in range(self.cfg.num_classes):
-            arr = np.stack(class_feats[label], 0); self.centers[label] = arr.mean(0)
-            intra = np.mean([np.linalg.norm(f-self.centers[label]) for f in arr])
+            arr = np.stack(class_feats[label], 0)
+            self.centers[label] = arr.mean(0)
+            intra = np.mean([np.linalg.norm(f - self.centers[label])
+                             for f in arr])
+            intra_stds.append(intra)
             print(f"  Class {label}: {len(arr)} samples, intra-std={intra:.3f}")
+
+        # Inter-class separation report
+        min_inter = float('inf')
+        max_inter = 0.0
+        for i in range(self.cfg.num_classes):
+            for j in range(i + 1, self.cfg.num_classes):
+                d = np.linalg.norm(self.centers[i] - self.centers[j])
+                min_inter = min(min_inter, d)
+                max_inter = max(max_inter, d)
+
+        sep_ratio = min_inter / (np.mean(intra_stds) + 1e-8)
+        print(f"  Inter-class: min={min_inter:.2f}, max={max_inter:.2f}, "
+              f"separation_ratio={sep_ratio:.2f}")
+        print(f"  ⚠ Low separation!" if sep_ratio < 2.0 else
+              f"  ✓ Good separation")
+
+        self.metrics.set('mean_intra_std', float(np.mean(intra_stds)))
+        self.metrics.set('min_inter_class', float(min_inter))
+        self.metrics.set('separation_ratio', float(sep_ratio))
+
+        self.timings['build_centers'] = time.time() - t0
         return self
 
-    # ===== PURIFICATION =====
+    # ================================================================
+    # PURIFICATION — THE CORE
+    # ================================================================
     def run_purification(self):
+        t0 = time.time()
         print("\n[5] Running purification pipeline...")
-        self.freq_filter = FrequencyFilter(self.cfg)
-        self.freq_filter.build_baseline(self.data['clean_files'], self.cfg.clean_dir)
 
-        grad_gen = GradientMaskGenerator(self.poisoned_model, self.cfg.target_class, self.device)
-        lpips_fn = lpips.LPIPS(net='alex').to(self.device); lpips_fn.eval()
-        # FeatureReconstructor uses CLEAN model for L_feat (better cluster structure)
-        reconstructor = FeatureReconstructor(self.clean_model, self.patchgan, lpips_fn,
-                                             self.cfg, self.mean_t, self.std_t)
-        em_iter = EMIterator(reconstructor, self.cfg, self.centers, self.device)
+        # Build frequency filter baseline
+        self.freq_filter = FrequencyFilter(self.cfg)
+        self.freq_filter.build_baseline(
+            self.data['clean_files'], self.cfg.clean_dir)
+
+        # Gradient mask generator — NOW with mean/std for IG baseline
+        self.grad_gen = GradientMaskGenerator(
+            self.poisoned_model, self.cfg.target_class,
+            self.device, self.cfg,
+            mean=self.mean_t, std=self.std_t)  # for black-pixel IG baseline
+
+        # LPIPS with configurable resize
+        lpips_size = getattr(self.cfg, 'lpips_resize', 64)
+        lpips_fn = lpips.LPIPS(net='alex').to(self.device)
+        lpips_fn.eval()
+
+        # Feature reconstructor
+        reconstructor = FeatureReconstructor(
+            self.clean_model, self.patchgan, lpips_fn,
+            self.cfg, self.mean_t, self.std_t)
+
+        # EM iterator
+        em_iter = EMIterator(
+            reconstructor, self.cfg, self.centers, self.device)
+
+        # Label calibrator
         label_cal = LabelCalibrator(self.centers, self.cfg)
 
+        # Center quality report
+        quality = label_cal.center_quality_report()
+        print(f"  Center quality: sep_ratio={quality['separation_ratio']:.3f}, "
+              f"min_inter={quality['min_inter_center_dist']:.2f}")
+
+        # Demo samples for visualization
         n_demo = min(self.cfg.n_demo_samples, len(self.data['pois_f_sub']))
-        d_idx = self.rng.choice(len(self.data['pois_f_sub']), n_demo, replace=False)
+        d_idx = self.rng.choice(
+            len(self.data['pois_f_sub']), n_demo, replace=False)
+
         all_diags, purified_dict = [], {}
 
         for di, idx in enumerate(d_idx):
-            fname = self.data['pois_f_sub'][idx]; tl = self.data['pois_l_sub'][idx]
+            fname = self.data['pois_f_sub'][idx]
+            tl = self.data['pois_l_sub'][idx]
             print(f"\n  --- S{di+1}/{n_demo}: {fname} (true={tl}) ---")
 
+            # Load clean + poisoned versions
             clean_t = self._load(fname, self.cfg.clean_dir).cpu()
             pois_t = self._load(fname, self.cfg.pois_dir)
-            pois_raw = (pois_t.to(self.device)*self.std_t+self.mean_t).unsqueeze(0)
-            pois_norm = pois_t.unsqueeze(0).to(self.device)
+            pois_raw = (pois_t.to(self.device) * self.std_t +
+                        self.mean_t).unsqueeze(0)  # [1, C, H, W] in [0,1]
+            pois_norm = pois_t.unsqueeze(0).to(self.device)  # normalized
 
-            d_clean = float(np.linalg.norm(self.clean_model.extract(clean_t.unsqueeze(0).to(self.device)).cpu().numpy()-self.centers[tl]))
-            d_pois_init = float(np.linalg.norm(self.clean_model.extract(pois_norm).cpu().numpy()-self.centers[tl]))
-
-            sd = {'fname':fname,'true_label':tl,'d_clean':d_clean,'d_pois_init':d_pois_init,
-                  'clean_tensor':clean_t,'pois_tensor':pois_t.cpu(),'stages':{}}
-            sd['stages']['0_input'] = {'img':pois_raw.detach().cpu(),'metrics':{'d_to_true_center':d_pois_init}}
-
-            # 2a
-            x_freq, d2a = self.freq_filter.process(pois_raw.clone())
-            d_a = float(np.linalg.norm(self.clean_model.extract(((x_freq-self.mean_t)/self.std_t)).cpu().numpy()-self.centers[tl]))
-            sd['stages']['2a_frequency'] = {'img':x_freq.detach().cpu(),'metrics':{'n_anomalous':d2a['n_anomalous'],'d_to_true_center':d_a,'fft_diag':d2a}}
-            print(f"    [2a] Freq: {d2a['n_anomalous']} anomalous bins, d={d_a:.2f}")
-
-            # 2b
-            with torch.enable_grad():
-                mask, d2b = grad_gen.generate((x_freq-self.mean_t)/self.std_t)
-            sd['stages']['2b_gradient'] = {'img':x_freq.detach().cpu(),'metrics':{'mask_mean':d2b['mask_mean'],'grad_diag':d2b}}
-            print(f"    [2b] Gradient: mask μ={d2b['mask_mean']:.3f}")
-
-            # 3+4
-            x_pur, em_records = em_iter.run(x_freq, x_freq, mask, tl)  # LPIPS ref = freq-cleaned, not poisoned
-            sd['em_records'] = em_records
-            for ei, emr in enumerate(em_records):
-                sd['stages'][f'em_iter{ei+1}'] = {'img':emr['img'],'metrics':{'d_center':emr['d_center'],'label':emr['label_after']}}
-
-            # 5
+            # Initial distances
             with torch.no_grad():
-                pf = self.clean_model.extract(((x_pur-self.mean_t)/self.std_t)).cpu().numpy()
-            fl, conf, d5 = label_cal.calibrate(pf); df = float(d5['distances'][tl])
-            sd['stages']['5_label'] = {'img':x_pur.cpu(),'metrics':{'final_label':fl,'true_label':tl,'confidence':conf,'d_to_true_center':df,'all_distances':d5['distances'],'high_confidence':d5['high_confidence']}}
+                clean_feat = self.clean_model.extract(
+                    clean_t.unsqueeze(0).to(self.device)).cpu().numpy()
+                pois_feat = self.clean_model.extract(pois_norm).cpu().numpy()
 
-            status = "HIGH" if d5['high_confidence'] else "LOW"
-            print(f"    [5] Label: {fl} (true={tl}), conf={conf:.2f} [{status}], d: {d_pois_init:.1f}>{d_a:.1f}>{df:.1f}, EM: {len(em_records)}")
+            d_clean = float(np.linalg.norm(clean_feat - self.centers[tl]))
+            d_pois_init = float(np.linalg.norm(pois_feat - self.centers[tl]))
 
-            all_diags.append(sd); purified_dict[fname] = x_pur.cpu()
-            self.metrics.add_sample({'fname':fname,'true_label':tl,'final_label':fl,'confidence':conf,'d_clean':d_clean,'d_pois':d_pois_init,'d_2a':d_a,'d_final':df,'n_em':len(em_records),'correct':fl==tl})
+            sd = {
+                'fname': fname, 'true_label': tl,
+                'd_clean': d_clean, 'd_pois_init': d_pois_init,
+                'clean_tensor': clean_t, 'pois_tensor': pois_t.cpu(),
+                'stages': {}
+            }
+            sd['stages']['0_input'] = {
+                'img': pois_raw.detach().cpu(),
+                'metrics': {'d_to_true_center': d_pois_init}
+            }
 
-        self.results = {'all_diags':all_diags,'purified_dict':purified_dict}
+            # ---- 2a: Frequency Filter ----
+            x_freq, d2a = self.freq_filter.process(pois_raw.clone())
+            with torch.no_grad():
+                feat_2a = self.clean_model.extract(
+                    ((x_freq - self.mean_t) / self.std_t)).cpu().numpy()
+                d_a = float(np.linalg.norm(feat_2a - self.centers[tl]))
+
+            sd['stages']['2a_frequency'] = {
+                'img': x_freq.detach().cpu(),
+                'metrics': {
+                    'n_anomalous': d2a['n_anomalous'],
+                    'd_to_true_center': d_a,
+                    'dirty': d2a.get('dirty', False),
+                    'fft_diag': d2a,
+                }
+            }
+            print(f"    [2a] Freq: {d2a['n_anomalous']} anomalous bins, "
+                  f"d={d_a:.2f} (was {d_pois_init:.2f}) "
+                  f"{'⚠ WORSE' if d_a > d_pois_init*1.1 else '✓'}")
+
+            # ---- 2b: Gradient Mask (FIXED: true_label for logit diff) ----
+            x_norm_2a = (x_freq - self.mean_t) / self.std_t
+            with torch.enable_grad():
+                mask, d2b = self.grad_gen.generate(x_norm_2a, true_label=tl)
+            sd['stages']['2b_gradient'] = {
+                'img': x_freq.detach().cpu(),
+                'metrics': {
+                    'mask_mean': d2b['mask_mean'],
+                    'mask_min': d2b['mask_min'],
+                    'mask_std': d2b['mask_std'],
+                    'grad_diag': d2b,
+                }
+            }
+            print(f"    [2b] Gradient: mask μ={d2b['mask_mean']:.3f}, "
+                  f"min={d2b['mask_min']:.3f}, "
+                  f"method={d2b.get('method','?')} "
+                  f"(target={self.cfg.target_class}, true={tl})")
+
+            # ---- 3+4: EM Iteration (FIXED: x_ref = x_freq, NOT pois_raw) ----
+            # Using freq-filtered image as reference avoids L_perc+L_pix
+            # pulling toward the original trigger pattern.
+            x_pur, em_records = em_iter.run(x_freq, x_freq, mask, tl)
+            sd['em_records'] = em_records
+
+            for ei, emr in enumerate(em_records):
+                sd['stages'][f'em_{emr["phase"]}_{ei}'] = {
+                    'img': emr['img'],
+                    'metrics': {
+                        'd_center': emr['d_center'],
+                        'label_before': emr['label_before'],
+                        'label_after': emr['label_after'],
+                        'phase': emr['phase'],
+                        'converged': emr.get('converged', False),
+                    }
+                }
+
+            # ---- 5: Label Calibration ----
+            with torch.no_grad():
+                pf = self.clean_model.extract(
+                    ((x_pur - self.mean_t) / self.std_t)).cpu().numpy()
+            fl, conf, d5 = label_cal.calibrate(pf)
+            df = float(d5['distances'][tl])
+
+            sd['stages']['5_label'] = {
+                'img': x_pur.cpu(),
+                'metrics': {
+                    'final_label': fl, 'true_label': tl,
+                    'confidence': conf,
+                    'd_to_true_center': df,
+                    'all_distances': d5['distances'],
+                    'high_confidence': d5['high_confidence'],
+                    'is_ambiguous': d5['is_ambiguous'],
+                }
+            }
+
+            status = ("HIGH" if d5['high_confidence'] else "LOW") + \
+                     (" AMBIG" if d5['is_ambiguous'] else "")
+            correct = "✓" if fl == tl else "✗"
+            print(f"    [5] Label: {fl} (true={tl}), conf={conf:.3f} "
+                  f"[{status}] {correct}, "
+                  f"d: {d_pois_init:.1f}>{d_a:.1f}>{df:.1f}, "
+                  f"EM: {len(em_records)}")
+
+            all_diags.append(sd)
+            purified_dict[fname] = x_pur.cpu()
+            self.metrics.add_sample({
+                'fname': fname, 'true_label': tl, 'final_label': fl,
+                'confidence': conf, 'd_clean': d_clean, 'd_pois': d_pois_init,
+                'd_2a': d_a, 'd_final': df, 'n_em': len(em_records),
+                'correct': fl == tl, 'is_ambiguous': d5['is_ambiguous'],
+                'grad_mask_mean': d2b['mask_mean'],
+                'freq_anomalous': d2a['n_anomalous'],
+            })
+
+        # Summary
+        n_correct = sum(1 for sd in all_diags
+                        if sd['stages']['5_label']['metrics']['final_label'] == sd['true_label'])
+        print(f"\n  Purification complete: {n_correct}/{n_demo} correct "
+              f"({100*n_correct/max(1,n_demo):.1f}%)")
+
+        self.results = {
+            'all_diags': all_diags,
+            'purified_dict': purified_dict,
+        }
+        self.timings['run_purification'] = time.time() - t0
         return self
 
-    # ===== VISUALIZATION =====
+    # ================================================================
+    # VISUALIZATION
+    # ================================================================
     def visualize(self):
         print("\n[6] Generating visualizations...")
         vis = Visualizer(self.cfg)
         for si, sd in enumerate(self.results['all_diags']):
-            vis.per_stage_grid(sd, si); vis.frequency(sd, si); vis.gradient(sd, si); vis.label_calib(sd, si)
+            vis.per_stage_grid(sd, si)
+            vis.frequency(sd, si)
+            vis.gradient(sd, si)
+            vis.label_calib(sd, si)
+
         vis.summary_grid(self.results['all_diags'], self.metrics)
 
         # t-SNE
-        cf = self._batch_extract(self.data['sel_clean_f'][:500], self.cfg.clean_dir)
-        pf = self._batch_extract(self.data['pois_f_sub'][:100], self.cfg.pois_dir)
+        cf = self._batch_extract(
+            self.data['sel_clean_f'][:500], self.cfg.clean_dir,
+            model=self.clean_model)
+        pf = self._batch_extract(
+            self.data['pois_f_sub'][:100], self.cfg.pois_dir,
+            model=self.clean_model)
         pur_f_list, pur_l_list = [], []
         for sd in self.results['all_diags']:
             with torch.no_grad():
-                pff = self.clean_model.extract(((sd['stages']['5_label']['img'].to(self.device)-self.mean_t)/self.std_t))
-                pur_f_list.append(pff.cpu().numpy().squeeze(0)); pur_l_list.append(sd['true_label'])
+                pff = self.clean_model.extract(
+                    ((sd['stages']['5_label']['img'].to(self.device) -
+                      self.mean_t) / self.std_t))
+                pur_f_list.append(pff.cpu().numpy().squeeze(0))
+                pur_l_list.append(sd['true_label'])
         if pur_f_list:
-            vis.tsne(cf, self.data['sel_clean_l'][:500], pf, self.data['pois_l_sub'][:100],
-                     np.stack(pur_f_list,0), np.array(pur_l_list))
+            vis.tsne(cf, self.data['sel_clean_l'][:500],
+                     pf, self.data['pois_l_sub'][:100],
+                     np.stack(pur_f_list, 0), np.array(pur_l_list))
+
+        # Timing summary
+        vis.timing_summary(self.timings, self.cfg.exp_dir)
+
         print(f"  Visuals: {self.cfg.exp_dir}")
         return self
 
     def save(self):
         self.cfg.save()
         self.metrics.save(os.path.join(self.cfg.exp_dir, 'metrics.json'))
+
+        # Save timing report
+        timing_path = os.path.join(self.cfg.exp_dir, 'timings.json')
+        import json
+        with open(timing_path, 'w') as f:
+            json.dump(self.timings, f, indent=2)
+
         print("\n" + self.metrics.summary())
+        print(f"\n  Timings: { {k: f'{v:.1f}s' for k, v in self.timings.items()} }")
         return self
 
-    # ===== Helpers =====
-    def _extract_label(self, fname):
+    # ================================================================
+    # HELPERS
+    # ================================================================
+    @staticmethod
+    def _extract_label(fname):
         parts = str(fname).split('-label-')
-        return int(parts[1].split('.')[0]) if len(parts)==2 else None
+        if len(parts) == 2:
+            try:
+                return int(parts[1].split('.')[0])
+            except ValueError:
+                return None
+        return None
 
     def _load(self, fname, d):
-        return self.img_transform(Image.open(os.path.join(d, fname)).convert('RGB'))
+        return self.img_transform(
+            Image.open(os.path.join(d, fname)).convert('RGB'))
 
     def _batch_extract(self, fl, d, bs=64, model=None):
-        if model is None: model = self.clean_model
+        if model is None:
+            model = self.clean_model
         feats = []
         for s in range(0, len(fl), bs):
-            b = [self._load(f, d) for f in fl[s:s+bs]]
-            feats.append(model.extract(torch.stack(b).to(self.device)).cpu().numpy())
+            b = [self._load(f, d) for f in fl[s:s + bs]]
+            if not b:
+                continue
+            feats.append(model.extract(
+                torch.stack(b).to(self.device)).cpu().numpy())
+        if not feats:
+            return np.zeros((0, self.cfg.feat_dim))
         return np.concatenate(feats, 0)
+
+    def _eval_acc(self, model, loader):
+        """Evaluate classification accuracy."""
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                correct += (model(x).argmax(1) == y).sum().item()
+                total += y.size(0)
+        return 100.0 * correct / total if total > 0 else 0.0
+
+    def _train_model(self, model, loader, epochs, desc=''):
+        """Generic model training with progress bar."""
+        opt = optim.Adam(model.parameters(), lr=0.001)
+        sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+        for ep in range(epochs):
+            model.train()
+            ep_loss, n_batch = 0.0, 0
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                opt.zero_grad()
+                loss = nn.CrossEntropyLoss()(model(x), y)
+                loss.backward()
+                opt.step()
+                ep_loss += loss.item()
+                n_batch += 1
+            sch.step()
+
+            if (ep + 1) % max(1, epochs // 5) == 0:
+                print(f"    [{desc}] epoch {ep+1}/{epochs}, "
+                      f"lr={sch.get_last_lr()[0]:.6f}, "
+                      f"loss={ep_loss/max(1,n_batch):.4f}")
+        model.eval()
+
+    # ================================================================
+    # PUBLIC API for evaluation
+    # ================================================================
+    def get_purified_samples(self) -> List[Tuple[torch.Tensor, int]]:
+        """Return purified tensors with their true labels for retraining."""
+        samples = []
+        for sd in self.results.get('all_diags', []):
+            img = sd['stages']['5_label']['img']
+            tl = sd['true_label']
+            samples.append((img, tl))
+        return samples
+
+    def get_clean_model_state(self):
+        """Return a deep copy of the clean model's state dict."""
+        if self.clean_model is None:
+            raise RuntimeError("Clean model not trained yet")
+        return copy.deepcopy(self.clean_model.state_dict())
