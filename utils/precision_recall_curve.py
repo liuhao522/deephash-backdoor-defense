@@ -4,11 +4,7 @@ plt.rcParams['font.sans-serif'] = [u'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 # Precision Recall Curve data
 pr_data = {
-    "DPSH": "../log/alexnet/DPSH_cifar10-1_48.json",
-    "DSH": "../log/alexnet/DSH_cifar10-1_48.json",
-    "DHN": "../log/alexnet/DHN_cifar10-1_48.json",
-    "HashNet": "../log/alexnet/HashNet_cifar10-1_48.json",
-    "DPN": "../log/alexnet/DPN_cifar10-1_48.json"
+    "CSQ_16": "../log/alexnet/CSQ_GTSRB_16.json",
 }
 N = 150
 # N = -1
