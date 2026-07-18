@@ -33,8 +33,8 @@ unsharp_threshold = 3  # 边缘增强阈值
 def extract_true_label(filename):
     """从文件名中提取真实标签"""
     basename = os.path.splitext(filename)[0]
-    if '-' in basename:
-        parts = basename.split('-')
+    if '-label-' in basename:
+        parts = basename.split('-label-')
         if len(parts) == 2:
             try:
                 return int(parts[1])
