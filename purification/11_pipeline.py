@@ -62,16 +62,26 @@ class PurificationPipeline:
         self.std_t = torch.tensor(config.std).view(
             config.img_channels, 1, 1).to(self.device)
 
-        # Image transform (normalized)
-        self.img_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(config.mean, config.std)
-        ])
-
-        # Image transform (unnormalized, for PatchGAN)
-        self.img_transform_raw = transforms.Compose([
-            transforms.ToTensor(),
-        ])
+        # Image transform (normalized) — backbone-aware Resize
+        backbone = getattr(config, 'backbone', 'mobilenet')
+        if backbone in ('resnet18', 'mobilenet'):
+            self.img_transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize(config.mean, config.std)
+            ])
+            self.img_transform_raw = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+            ])
+        else:
+            self.img_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(config.mean, config.std)
+            ])
+            self.img_transform_raw = transforms.Compose([
+                transforms.ToTensor(),
+            ])
 
         # State
         self.clean_model: Optional[nn.Module] = None
@@ -358,7 +368,7 @@ class PurificationPipeline:
                 for fn in bf_clean:
                     img = Image.open(os.path.join(
                         self.cfg.clean_dir, fn)).convert('RGB')
-                    real_imgs.append(transforms.ToTensor()(img))
+                    real_imgs.append(self.img_transform_raw(img))
                 real = torch.stack(real_imgs).to(self.device)
 
                 # Fake: mix of REAL poisoned images + Gaussian noise
@@ -370,7 +380,7 @@ class PurificationPipeline:
                     for pi in p_idx:
                         pimg = Image.open(os.path.join(
                             self.cfg.pois_dir, pf[pi])).convert('RGB')
-                        fake_imgs.append(transforms.ToTensor()(pimg))
+                        fake_imgs.append(self.img_transform_raw(pimg))
 
                 # If not enough poisoned, add noisy versions too
                 while len(fake_imgs) < len(real_imgs):
@@ -405,15 +415,19 @@ class PurificationPipeline:
     # ================================================================
     def build_centers(self):
         t0 = time.time()
-        print("[5] Building class centers (clean model features)...")
+        use_logits = getattr(self.cfg, 'use_logits_space', True)
+        space_name = "logits (10-dim)" if use_logits else f"features ({self.cfg.feat_dim}-dim)"
+        print(f"[5] Building class centers in {space_name}...")
 
         feats = self._batch_extract(
-            self.data['sel_clean_f'], self.cfg.clean_dir, model=self.clean_model)
+            self.data['sel_clean_f'], self.cfg.clean_dir,
+            model=self.clean_model, use_logits=use_logits)
         class_feats = defaultdict(list)
         for feat, label in zip(feats, self.data['sel_clean_l']):
             class_feats[label].append(feat)
 
-        self.centers = np.zeros((self.cfg.num_classes, self.cfg.feat_dim))
+        center_dim = self.cfg.num_classes if use_logits else self.cfg.feat_dim
+        self.centers = np.zeros((self.cfg.num_classes, center_dim))
         intra_stds = []
         for label in range(self.cfg.num_classes):
             arr = np.stack(class_feats[label], 0)
@@ -504,14 +518,13 @@ class PurificationPipeline:
                         self.mean_t).unsqueeze(0)  # [1, C, H, W] in [0,1]
             pois_norm = pois_t.unsqueeze(0).to(self.device)  # normalized
 
-            # Initial distances
+            # Initial distances (in logits or feature space)
             with torch.no_grad():
-                clean_feat = self.clean_model.extract(
-                    clean_t.unsqueeze(0).to(self.device)).cpu().numpy()
-                pois_feat = self.clean_model.extract(pois_norm).cpu().numpy()
+                clean_repr = self._repr(clean_t.unsqueeze(0).to(self.device))
+                pois_repr = self._repr(pois_norm)
 
-            d_clean = float(np.linalg.norm(clean_feat - self.centers[tl]))
-            d_pois_init = float(np.linalg.norm(pois_feat - self.centers[tl]))
+            d_clean = float(np.linalg.norm(clean_repr - self.centers[tl]))
+            d_pois_init = float(np.linalg.norm(pois_repr - self.centers[tl]))
 
             sd = {
                 'fname': fname, 'true_label': tl,
@@ -527,9 +540,8 @@ class PurificationPipeline:
             # ---- 2a: Frequency Filter ----
             x_freq, d2a = self.freq_filter.process(pois_raw.clone())
             with torch.no_grad():
-                feat_2a = self.clean_model.extract(
-                    ((x_freq - self.mean_t) / self.std_t)).cpu().numpy()
-                d_a = float(np.linalg.norm(feat_2a - self.centers[tl]))
+                repr_2a = self._repr(((x_freq - self.mean_t) / self.std_t))
+                d_a = float(np.linalg.norm(repr_2a - self.centers[tl]))
 
             sd['stages']['2a_frequency'] = {
                 'img': x_freq.detach().cpu(),
@@ -582,9 +594,8 @@ class PurificationPipeline:
 
             # ---- 5: Label Calibration ----
             with torch.no_grad():
-                pf = self.clean_model.extract(
-                    ((x_pur - self.mean_t) / self.std_t)).cpu().numpy()
-            fl, conf, d5 = label_cal.calibrate(pf)
+                pur_repr = self._repr(((x_pur - self.mean_t) / self.std_t))
+            fl, conf, d5 = label_cal.calibrate(pur_repr)
             df = float(d5['distances'][tl])
 
             sd['stages']['5_label'] = {
@@ -646,18 +657,22 @@ class PurificationPipeline:
         vis.summary_grid(self.results['all_diags'], self.metrics)
 
         # t-SNE
+        use_logits = getattr(self.cfg, 'use_logits_space', True)
         cf = self._batch_extract(
             self.data['sel_clean_f'][:500], self.cfg.clean_dir,
-            model=self.clean_model)
+            model=self.clean_model, use_logits=use_logits)
         pf = self._batch_extract(
             self.data['pois_f_sub'][:100], self.cfg.pois_dir,
-            model=self.clean_model)
+            model=self.clean_model, use_logits=use_logits)
         pur_f_list, pur_l_list = [], []
         for sd in self.results['all_diags']:
             with torch.no_grad():
-                pff = self.clean_model.extract(
-                    ((sd['stages']['5_label']['img'].to(self.device) -
-                      self.mean_t) / self.std_t))
+                x_norm = (sd['stages']['5_label']['img'].to(self.device) -
+                          self.mean_t) / self.std_t
+                if use_logits:
+                    pff = self.clean_model(x_norm)
+                else:
+                    pff = self.clean_model.extract(x_norm)
                 pur_f_list.append(pff.cpu().numpy().squeeze(0))
                 pur_l_list.append(sd['true_label'])
         if pur_f_list:
@@ -702,7 +717,7 @@ class PurificationPipeline:
         return self.img_transform(
             Image.open(os.path.join(d, fname)).convert('RGB'))
 
-    def _batch_extract(self, fl, d, bs=64, model=None):
+    def _batch_extract(self, fl, d, bs=64, model=None, use_logits=False):
         if model is None:
             model = self.clean_model
         feats = []
@@ -710,11 +725,23 @@ class PurificationPipeline:
             b = [self._load(f, d) for f in fl[s:s + bs]]
             if not b:
                 continue
-            feats.append(model.extract(
-                torch.stack(b).to(self.device)).cpu().numpy())
+            x = torch.stack(b).to(self.device)
+            if use_logits:
+                with torch.no_grad():
+                    feats.append(model(x).cpu().numpy())  # logits [B, 10]
+            else:
+                feats.append(model.extract(x).cpu().numpy())
         if not feats:
-            return np.zeros((0, self.cfg.feat_dim))
+            return np.zeros((0, self.cfg.num_classes if use_logits else self.cfg.feat_dim))
         return np.concatenate(feats, 0)
+
+    def _repr(self, x_norm):
+        """Get representation: logits (10-dim) or features (256-dim)."""
+        if getattr(self.cfg, 'use_logits_space', True):
+            with torch.no_grad():
+                return self.clean_model(x_norm).cpu().numpy()
+        else:
+            return self.clean_model.extract(x_norm).cpu().numpy()
 
     def _eval_acc(self, model, loader):
         """Evaluate classification accuracy."""

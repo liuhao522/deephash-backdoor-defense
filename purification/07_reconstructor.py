@@ -22,17 +22,16 @@ class FeatureReconstructor:
     """Module 3 — Feature-Constrained Reconstruction.
 
     Composite loss:
-      L = λ_feat · L_feat     (feature-space consistency with target center)
+      L = λ_feat · L_feat     (logits/feature consistency with target center)
         + λ_center · L_center (direct center distance)
         + λ_perc · LPIPS      (perceptual similarity to reference)
         + λ_adv · L_adv       (PatchGAN realism constraint)
         + λ_pix · L_pix       (masked pixel-wise similarity)
         + λ_tv · TV           (total variation smoothness)
 
-    The key insight: L_feat + L_center together keep the purified image's
-    features close to the CURRENT target center, while LPIPS+L_pix keep
-    it visually similar to the original. The mask down-weights trigger
-    regions in the pixel loss, allowing those regions to change more.
+    When use_logits_space=True, L_feat uses classifier logits (10-dim)
+    instead of raw features (256-dim). Logits space has natural class
+    separation.
     """
 
     def __init__(self, model, patchgan, lpips_fn, config, mean_t, std_t):
@@ -43,10 +42,9 @@ class FeatureReconstructor:
         self.mean = mean_t
         self.std = std_t
 
-        # LPIPS resize target
         self.lpips_size = getattr(config, 'lpips_resize', 64)
+        self.use_logits = getattr(config, 'use_logits_space', True)
 
-        # Loss weights
         self.w_feat = config.lambda_feat
         self.w_center = getattr(config, 'lambda_center', 0.5)
         self.w_perc = config.lambda_perc
@@ -98,12 +96,15 @@ class FeatureReconstructor:
         x_c = x_opt.clamp(0, 1)
         x_n = (x_c - self.mean) / self.std
 
-        # ---- 1. Feature loss ----
-        feats = self.model.extract_with_grad(x_n)
-        L_feat = torch.norm(feats - target_center) ** 2
+        # ---- 1. Feature loss (logits or features) ----
+        if self.use_logits:
+            repr_vec = self.model(x_n)        # logits [B, 10]
+        else:
+            repr_vec = self.model.extract_with_grad(x_n)  # features [B, 256]
+        L_feat = torch.norm(repr_vec - target_center) ** 2
 
         # ---- 2. Center distance ----
-        L_center = torch.norm(feats - target_center)
+        L_center = torch.norm(repr_vec - target_center)
 
         # ---- 3. LPIPS: optimize vs FREQ-FILTERED ref (no trigger!) ----
         x_lpips_opt = self._prep_lpips(x_c)

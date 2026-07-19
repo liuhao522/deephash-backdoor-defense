@@ -44,8 +44,6 @@ class ExperimentRunner:
         results = {}
 
         # ---- 0. Pre-baseline: save original poisoned model state ----
-        # This ensures no baseline can corrupt the original
-        import copy
         poisoned_state = copy.deepcopy(poisoned_model.state_dict())
 
         def _restore_poisoned():

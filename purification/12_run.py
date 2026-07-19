@@ -59,6 +59,10 @@ def main():
                         help='Gradient mask floor')
     parser.add_argument('--em_init', type=str, default='nearest',
                         choices=['nearest', 'true_label', 'top3_nearest'])
+    parser.add_argument('--coarse_steps', type=int, default=None,
+                        help='EM coarse optimization steps per iter')
+    parser.add_argument('--fine_steps', type=int, default=None,
+                        help='EM fine optimization steps per iter')
     parser.add_argument('--clean_epochs', type=int, default=None,
                         help='Override clean model epochs')
     parser.add_argument('--lpips_size', type=int, default=64,
@@ -102,6 +106,10 @@ def main():
 
     if args.clean_epochs is not None:
         config.model_epochs_clean = args.clean_epochs
+    if args.coarse_steps is not None:
+        config.opt_steps_coarse = args.coarse_steps
+    if args.fine_steps is not None:
+        config.opt_steps_fine = args.fine_steps
 
     if args.skip_freq:
         config.freq_method = 'none'
@@ -159,14 +167,22 @@ def main():
         print("BASELINE COMPARISONS")
         print(f"{'='*60}")
 
-        # Prepare test loader
-        cifar_test = datasets.CIFAR10(
-            root='./data', train=False, download=True,
-            transform=transforms.Compose([
+        # Prepare test loader — resize depends on backbone
+        backbone = getattr(config, 'backbone', 'mobilenet')
+        if backbone in ('resnet18', 'mobilenet'):
+            test_tf = transforms.Compose([
                 transforms.Resize(224),
                 transforms.ToTensor(),
                 transforms.Normalize(config.mean, config.std)
-            ]))
+            ])
+        else:
+            test_tf = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(config.mean, config.std)
+            ])
+        cifar_test = datasets.CIFAR10(
+            root='./data', train=False, download=True,
+            transform=test_tf)
         test_loader = DataLoader(
             cifar_test, batch_size=config.batch_size, shuffle=False)
 

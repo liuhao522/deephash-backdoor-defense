@@ -56,10 +56,24 @@ class Visualizer:
         d = diag['stages'].get('2a_frequency',{}).get('metrics',{}).get('fft_diag',{})
         if not d or d.get('n_anomalous',0)==0: return
         fig, axes = plt.subplots(1,3,figsize=(15,4))
-        axes[0].imshow(np.log1p(np.fft.fftshift(d['fft_mag_original'])),cmap='hot'); axes[0].set_title('FFT Before'); axes[0].axis('off')
-        axes[1].imshow(np.fft.fftshift(d['z_score']),cmap='RdBu_r',vmin=-3,vmax=8)
+        # fft_mag_original is [C,H,W] — average over channels for display
+        mag = d['fft_mag_original']
+        if mag is not None:
+            if mag.ndim == 3: mag = mag.mean(0)
+            axes[0].imshow(np.log1p(np.fft.fftshift(mag)),cmap='hot')
+        axes[0].set_title(f'DCT/FFT Before ({d.get("method","?")})'); axes[0].axis('off')
+        # z_score is [C,H,W] — average over channels
+        zs = d.get('z_score')
+        if zs is not None:
+            if zs.ndim == 3: zs = zs.mean(0)
+            axes[1].imshow(np.fft.fftshift(zs),cmap='RdBu_r',vmin=-3,vmax=8)
         axes[1].set_title(f'Z-Score ({d["n_anomalous"]} bins >{self.cfg.freq_z_threshold}σ)'); axes[1].axis('off')
-        axes[2].imshow(d['anomalous_mask'],cmap='Reds'); axes[2].set_title('Suppressed Bins'); axes[2].axis('off')
+        # anomalous_mask is [C,H,W] — any channel anomalous → pixel anomalous
+        am = d.get('anomalous_mask')
+        if am is not None:
+            if am.ndim == 3: am = am.any(0)
+            axes[2].imshow(np.fft.fftshift(am),cmap='Reds')
+        axes[2].set_title('Suppressed Bins'); axes[2].axis('off')
         plt.suptitle(f'S{idx+1}: Frequency Analysis', fontweight='bold'); plt.tight_layout()
         plt.savefig(f'{self.cfg.stage_dir}/sample{idx+1}_frequency.png',dpi=150); plt.close()
 

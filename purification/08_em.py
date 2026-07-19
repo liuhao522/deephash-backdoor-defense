@@ -39,8 +39,9 @@ class EMIterator:
     def __init__(self, reconstructor, config, ordered_centers, device):
         self.rec = reconstructor
         self.cfg = config
-        self.centers = ordered_centers  # [num_classes, feat_dim]
+        self.centers = ordered_centers  # [num_classes, center_dim]
         self.device = device
+        self.use_logits = getattr(config, 'use_logits_space', True)
 
         # Config — FIXED: reduced coarse steps to prevent overshooting
         self.max_iter = getattr(config, 'em_max_iter', 8)
@@ -54,10 +55,17 @@ class EMIterator:
     # ================================================================
     # Feature distance helper
     # ================================================================
+    def _get_repr(self, x_norm: torch.Tensor) -> np.ndarray:
+        """Get logits or features depending on config."""
+        with torch.no_grad():
+            if self.use_logits:
+                return self.rec.model(x_norm).cpu().numpy()
+            else:
+                return self.rec.model.extract(x_norm).cpu().numpy()
+
     def _feat_dist(self, x_norm: torch.Tensor) -> np.ndarray:
         """Compute distances from normalized image to all class centers."""
-        with torch.no_grad():
-            feat = self.rec.model.extract(x_norm).cpu().numpy()
+        feat = self._get_repr(x_norm)
         return np.array([
             float(np.linalg.norm(feat - self.centers[k]))
             for k in range(self.cfg.num_classes)
@@ -65,8 +73,7 @@ class EMIterator:
 
     def _feat_dist_to_center(self, x_norm: torch.Tensor, label: int) -> float:
         """Distance to a specific class center."""
-        with torch.no_grad():
-            feat = self.rec.model.extract(x_norm).cpu().numpy()
+        feat = self._get_repr(x_norm)
         return float(np.linalg.norm(feat - self.centers[label]))
 
     # ================================================================

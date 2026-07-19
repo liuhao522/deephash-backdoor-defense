@@ -45,9 +45,10 @@ def _build_model_for_device(config, device) -> nn.Module:
 
 
 def _make_transform(config, resize=True):
-    """Standard image transform."""
+    """Standard image transform. Respects backbone input size."""
+    backbone = getattr(config, 'backbone', 'mobilenet')
     t_list = []
-    if resize:
+    if resize and backbone in ('resnet18', 'mobilenet'):
         t_list.append(transforms.Resize(224))
     t_list.append(transforms.ToTensor())
     t_list.append(transforms.Normalize(config.mean, config.std))
@@ -320,12 +321,13 @@ class BaselinePurification:
         opt = optim.Adam(self.model.parameters(), lr=0.001)
         sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
 
+        backbone = getattr(self.cfg, 'backbone', 'mobilenet')
         for ep in range(n_epochs):
             self.model.train()
             for x, y in loader:
                 x, y = x.to(self.device), y.to(self.device)
-                # Ensure x is [B, 3, 32, 32] or [B, 3, 224, 224]
-                if x.size(-1) == 32:
+                # Upsample 32→224 only for ImageNet-scale backbones
+                if x.size(-1) == 32 and backbone in ('resnet18', 'mobilenet'):
                     x = nn.functional.interpolate(
                         x, size=(224, 224), mode='bilinear', align_corners=False)
                 opt.zero_grad()

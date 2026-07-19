@@ -35,10 +35,12 @@ class PipelineConfig:
     # Model — Clean feature extractor
     # ================================================================
     feat_dim: int = 256
-    model_epochs_clean: int = 25          # more epochs for reliable centers
-    model_epochs_poisoned: int = 15       # enough for ASR
+    model_epochs_clean: int = 25
+    model_epochs_poisoned: int = 15
     batch_size: int = 128
-    backbone: str = 'mobilenet'           # 'cnn' / 'resnet18' / 'mobilenet'
+    backbone: str = 'mobilenet'
+    use_logits_space: bool = True        # centers/distances in logits (10-dim)
+                                          # instead of raw features (256-dim)
 
     # ================================================================
     # PatchGAN — Natural image prior
@@ -81,13 +83,13 @@ class PipelineConfig:
     # ================================================================
     # EM Iteration (Module 4) — FIXED INIT
     # ================================================================
-    em_max_iter: int = 8                  # was 5, more iterations
-    em_conv_threshold: float = 0.02       # was 0.03
-    em_init_mode: str = 'nearest'         # 'nearest' | 'true_label' (was hardcoded true_label)
-    opt_steps_coarse: int = 150           # was 100
-    opt_steps_fine: int = 300             # was 200
-    lr_coarse: float = 0.03               # was 0.05 (slightly lower for stability)
-    lr_fine: float = 0.01                 # was 0.02
+    em_max_iter: int = 8
+    em_conv_threshold: float = 0.02
+    em_init_mode: str = 'nearest'
+    opt_steps_coarse: int = 100           # per-EM-iter coarse Adam steps
+    opt_steps_fine: int = 200             # per-EM-iter fine Adam steps
+    lr_coarse: float = 0.02               # coarse phase learning rate
+    lr_fine: float = 0.01                 # fine phase learning rate
 
     # ================================================================
     # Label Calibration (Module 5) — IMPROVED
