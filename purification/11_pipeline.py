@@ -508,7 +508,7 @@ class PurificationPipeline:
               f"min_inter={quality['min_inter_center_dist']:.2f}")
 
         # Demo samples for visualization
-        n_all = len(self.data['pois_f_sub'])
+        n_all = min(self.cfg.n_purify, len(self.data['pois_f_sub']))
         n_demo = min(self.cfg.n_demo_samples, n_all)
         all_idx = list(range(n_all))
         self.rng.shuffle(all_idx)
@@ -794,12 +794,27 @@ class PurificationPipeline:
     # PUBLIC API for evaluation
     # ================================================================
     def get_purified_samples(self) -> List[Tuple[torch.Tensor, int]]:
-        """Return purified tensors with their true labels for retraining."""
+        """Return ALL training samples: purified + unpurified with true labels.
+
+        Only the first n_purify samples are purified; the rest use the original
+        poisoned image as-is with their ground-truth (clean) label.
+        """
         samples = []
+        # Purified samples
         for sd in self.results.get('all_diags', []):
             img = sd['stages']['5_label']['img']
             tl = sd['true_label']
             samples.append((img, tl))
+
+        # Remaining poisoned samples — use original image + true label (no purification)
+        n_purified = len(self.results.get('all_diags', []))
+        for i in range(n_purified, len(self.data['pois_f_sub'])):
+            fname = self.data['pois_f_sub'][i]
+            tl = self.data['pois_l_sub'][i]
+            img = transforms.ToTensor()(
+                Image.open(os.path.join(self.cfg.pois_dir, fname)).convert('RGB'))
+            samples.append((img, tl))
+
         return samples
 
     def get_clean_model_state(self):

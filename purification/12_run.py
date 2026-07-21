@@ -67,6 +67,8 @@ def main():
                         help='Override clean model epochs')
     parser.add_argument('--lpips_size', type=int, default=64,
                         help='LPIPS resize target size')
+    parser.add_argument('--n_purify', type=int, default=20,
+                        help='Number of poisoned samples to purify (rest use as-is with true labels)')
 
     # ---- Modes ----
     parser.add_argument('--ablation', action='store_true',
@@ -103,6 +105,7 @@ def main():
     config.grad_mask_floor = args.grad_floor
     config.em_init_mode = args.em_init
     config.lpips_resize = args.lpips_size
+    config.n_purify = args.n_purify
 
     if args.clean_epochs is not None:
         config.model_epochs_clean = args.clean_epochs

@@ -103,6 +103,8 @@ class PipelineConfig:
     n_clean_per_class: int = 200
     n_demo_samples: int = 60
     n_poisoned_total: int = 200
+    n_purify: int = 20                   # how many poisoned samples to actually purify;
+                                         # the rest use original image + true label as-is
 
     # ================================================================
     # Evaluation — BASELINE FIXES
