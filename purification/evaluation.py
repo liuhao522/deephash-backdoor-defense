@@ -74,7 +74,7 @@ class ExperimentRunner:
         from baselines import BaselineFineTuning
         ft = BaselineFineTuning(self.cfg)
         ft_result = ft.run(
-            poisoned_model, data['sel_clean_f'], data['sel_clean_l'], test_loader)
+            poisoned_model, data['clean_files'], data['clean_labels'], test_loader)
         results['Fine-Tuning'] = ft_result
         print(f"  CA={ft_result['CA']:.1f}%")
 
@@ -87,7 +87,7 @@ class ExperimentRunner:
         bp = BaselinePurification(self.cfg)
         ours_result = bp.run(
             purified_samples,
-            data['sel_clean_f'], data['sel_clean_l'],
+            data['clean_files'], data['clean_labels'],
             test_loader,
             n_epochs=getattr(self.cfg, 'ft_epochs', 10)
         )
@@ -102,7 +102,7 @@ class ExperimentRunner:
             nad = BaselineNAD(self.cfg)
             nad_result = nad.run(
                 pipeline.clean_model, poisoned_model,
-                data['sel_clean_f'], data['sel_clean_l'],
+                data['clean_files'], data['clean_labels'],
                 test_loader)
             results['NAD'] = nad_result
             print(f"  CA={nad_result['CA']:.1f}%")

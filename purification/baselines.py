@@ -195,12 +195,12 @@ class BaselineFineTuning:
         ds = _DS(clean_files, clean_labels, self.cfg.clean_dir, img_t)
         loader = DataLoader(ds, batch_size=self.cfg.batch_size, shuffle=True)
 
-        # IMPROVED: reset classifier head to remove backdoor bias
-        # Then fine-tune full model with appropriate LR
-        self._reset_classifier_head(ft_model)
+        # IMPROVED: fully re-initialize the entire classifier head (not just last layer)
+        # Then train full model from scratch-equivalent state on clean data
+        self._reinit_classifier(ft_model)
         ft_model.train()
 
-        # Train full model (no freezing needed with reset head)
+        # Train full model with standard LR schedule
         opt = optim.Adam(ft_model.parameters(), lr=lr)
         sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -216,6 +216,19 @@ class BaselineFineTuning:
         ca = _Evaluator.ca(ft_model, test_loader, self.device)
 
         return {'CA': ca, 'DR': 100.0, 'note': 'Fine-Tuning'}
+
+    @staticmethod
+    def _reinit_classifier(model):
+        """Fully re-initialize ALL classifier layers (not just last). 
+        This removes backdoor bias from the entire fc head."""
+        import torch.nn.init as init
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Re-init all Linear layers in the classifier (fc or proj)
+                init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    init.constant_(module.bias, 0)
+                print(f"    Re-initialized: {name} (out={module.out_features})")
 
     @staticmethod
     def _reset_classifier_head(model):
