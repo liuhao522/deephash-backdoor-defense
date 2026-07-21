@@ -1,0 +1,8 @@
+{
+  "load_data": 0.3229990005493164,
+  "train_clean_model": 2859.671085357666,
+  "train_poisoned_model": 189.02628231048584,
+  "train_patchgan": 67.38547825813293,
+  "build_centers": 2.8741085529327393,
+  "run_purification": 97.64124464988708
+}

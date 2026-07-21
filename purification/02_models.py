@@ -101,12 +101,14 @@ class FeatureExtractor(nn.Module):
         out = self.pool3(out)
         out = F.relu(self.block4(out))
         out = self.avgpool(out).flatten(1)
-        feat = F.relu(self.fc[0](out))   # [0]=Linear(256,feat_dim)
+        # Raw Linear output (no ReLU) → signed features for cosine distance
+        feat_raw = self.fc[0](out)         # [0]=Linear(256,feat_dim)
         if return_feat:
-            return feat                    # features
-        feat = self.fc[1](feat)            # [1]=ReLU
-        feat = self.fc[2](feat)            # [2]=Dropout
-        return self.fc[3](feat)            # [3]=Linear(feat_dim,10) → logits
+            return feat_raw                 # ± values, full cosine range [0,2]
+        feat = F.relu(feat_raw)             # ReLU for classification path
+        feat = self.fc[1](feat)             # [1]=ReLU
+        feat = self.fc[2](feat)             # [2]=Dropout
+        return self.fc[3](feat)             # [3]=Linear(feat_dim,10) → logits
 
     @torch.no_grad()
     def extract(self, x):
@@ -147,12 +149,13 @@ class ResNet18Extractor(nn.Module):
 
     def forward(self, x, return_feat=False):
         f = self.features(x).flatten(1)
-        feat = F.relu(self.fc[0](f))   # [0]=Linear(512,256)
+        feat_raw = self.fc[0](f)          # [0]=Linear(512,256) — no ReLU
         if return_feat:
-            return feat                  # 256-dim features
-        feat = self.fc[1](feat)          # [1]=ReLU
-        feat = self.fc[2](feat)          # [2]=Dropout
-        return self.fc[3](feat)          # [3]=Linear(256,10) → logits
+            return feat_raw                # ± values, full cosine range [0,2]
+        feat = F.relu(feat_raw)            # ReLU for classification path
+        feat = self.fc[1](feat)            # [1]=ReLU
+        feat = self.fc[2](feat)            # [2]=Dropout
+        return self.fc[3](feat)            # [3]=Linear(256,10) → logits
 
     @torch.no_grad()
     def extract(self, x):
@@ -185,12 +188,13 @@ class MobileNetV3Extractor(nn.Module):
     def forward(self, x, return_feat=False):
         f = self.features(x)
         f = self.avgpool(f).flatten(1)
-        feat = F.relu(self.proj[0](f))  # [0]=Linear(576,256)
+        feat_raw = self.proj[0](f)         # [0]=Linear(576,256) — no ReLU
         if return_feat:
-            return feat                  # 256-dim features
-        feat = self.proj[1](feat)        # [1]=ReLU
-        feat = self.proj[2](feat)        # [2]=Dropout
-        return self.proj[3](feat)        # [3]=Linear(256,10) → logits
+            return feat_raw                 # ± values, full cosine range [0,2]
+        feat = F.relu(feat_raw)             # ReLU for classification path
+        feat = self.proj[1](feat)           # [1]=ReLU
+        feat = self.proj[2](feat)           # [2]=Dropout
+        return self.proj[3](feat)           # [3]=Linear(256,10) → logits
 
     @torch.no_grad()
     def extract(self, x):

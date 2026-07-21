@@ -41,7 +41,7 @@ class EMIterator:
         self.cfg = config
         self.centers = ordered_centers  # [num_classes, center_dim]
         self.device = device
-        self.use_logits = getattr(config, 'use_logits_space', True)
+        self.use_logits = getattr(config, 'use_logits_space', False)
 
         # Config — FIXED: reduced coarse steps to prevent overshooting
         self.max_iter = getattr(config, 'em_max_iter', 8)
@@ -53,7 +53,7 @@ class EMIterator:
         self.lr_fine = getattr(config, 'lr_fine', 0.01)
 
     # ================================================================
-    # Feature distance helper
+    # Feature distance helper — cosine distance (scale-invariant)
     # ================================================================
     def _get_repr(self, x_norm: torch.Tensor) -> np.ndarray:
         """Get logits or features depending on config."""
@@ -63,18 +63,22 @@ class EMIterator:
             else:
                 return self.rec.model.extract(x_norm).cpu().numpy()
 
+    def _cosine_dist(self, feat: np.ndarray, center: np.ndarray) -> float:
+        """Cosine distance: 1 - cos_similarity. Scale-invariant."""
+        fn = feat / (np.linalg.norm(feat) + 1e-8)
+        cn = center / (np.linalg.norm(center) + 1e-8)
+        return float(1.0 - np.dot(fn, cn))
+
     def _feat_dist(self, x_norm: torch.Tensor) -> np.ndarray:
-        """Compute distances from normalized image to all class centers."""
+        """Compute cosine distances to all class centers."""
         feat = self._get_repr(x_norm)
-        return np.array([
-            float(np.linalg.norm(feat - self.centers[k]))
-            for k in range(self.cfg.num_classes)
-        ])
+        return np.array([self._cosine_dist(feat, self.centers[k])
+                         for k in range(self.cfg.num_classes)])
 
     def _feat_dist_to_center(self, x_norm: torch.Tensor, label: int) -> float:
-        """Distance to a specific class center."""
+        """Cosine distance to a specific class center."""
         feat = self._get_repr(x_norm)
-        return float(np.linalg.norm(feat - self.centers[label]))
+        return self._cosine_dist(feat, self.centers[label])
 
     # ================================================================
     # Initialization

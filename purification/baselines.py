@@ -195,24 +195,14 @@ class BaselineFineTuning:
         ds = _DS(clean_files, clean_labels, self.cfg.clean_dir, img_t)
         loader = DataLoader(ds, batch_size=self.cfg.batch_size, shuffle=True)
 
-        # Two-phase fine-tuning: first freeze backbone, then unfreeze
+        # IMPROVED: reset classifier head to remove backdoor bias
+        # Then fine-tune full model with appropriate LR
+        self._reset_classifier_head(ft_model)
         ft_model.train()
 
-        # Phase 1: freeze feature extractor, train only classifier (2 epochs)
-        # Find feature layers vs classifier layers
-        self._freeze_features(ft_model, freeze=True)
-        opt = optim.Adam(filter(lambda p: p.requires_grad, ft_model.parameters()), lr=lr)
-        for ep in range(min(2, epochs)):
-            for x, y in loader:
-                x, y = x.to(self.device), y.to(self.device)
-                opt.zero_grad()
-                nn.CrossEntropyLoss()(ft_model(x), y).backward()
-                opt.step()
-
-        # Phase 2: unfreeze all, lower LR
-        self._freeze_features(ft_model, freeze=False)
-        opt = optim.Adam(ft_model.parameters(), lr=lr * 0.5)
-        sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs - 2)
+        # Train full model (no freezing needed with reset head)
+        opt = optim.Adam(ft_model.parameters(), lr=lr)
+        sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
         for ep in range(epochs - 2):
             for x, y in loader:
@@ -226,6 +216,19 @@ class BaselineFineTuning:
         ca = _Evaluator.ca(ft_model, test_loader, self.device)
 
         return {'CA': ca, 'DR': 100.0, 'note': 'Fine-Tuning'}
+
+    @staticmethod
+    def _reset_classifier_head(model):
+        """Reset the classifier head (fc/proj layers) to remove backdoor bias."""
+        import torch.nn.init as init
+        for name, module in model.named_modules():
+            # Reset any Linear layer that produces num_classes outputs
+            if isinstance(module, torch.nn.Linear):
+                if hasattr(module, 'out_features') and module.out_features == 10:
+                    init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                    if module.bias is not None:
+                        init.constant_(module.bias, 0)
+                    print(f"    Reset classifier head: {name}")
 
     @staticmethod
     def _freeze_features(model, freeze=True):
@@ -288,7 +291,11 @@ class BaselinePurification:
         all_imgs = list(purified_imgs)
         all_labels = list(purified_labels)
 
-        img_t = transforms.ToTensor()
+        backbone = getattr(self.cfg, 'backbone', 'mobilenet')
+        if backbone in ('resnet18', 'mobilenet'):
+            img_t = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
+        else:
+            img_t = transforms.ToTensor()
         norm_t = transforms.Normalize(self.cfg.mean, self.cfg.std)
 
         for fname, label in zip(clean_files, clean_labels):

@@ -43,7 +43,7 @@ class FeatureReconstructor:
         self.std = std_t
 
         self.lpips_size = getattr(config, 'lpips_resize', 64)
-        self.use_logits = getattr(config, 'use_logits_space', True)
+        self.use_logits = getattr(config, 'use_logits_space', False)
 
         self.w_feat = config.lambda_feat
         self.w_center = getattr(config, 'lambda_center', 0.5)
@@ -101,10 +101,12 @@ class FeatureReconstructor:
             repr_vec = self.model(x_n)        # logits [B, 10]
         else:
             repr_vec = self.model.extract_with_grad(x_n)  # features [B, 256]
-        L_feat = torch.norm(repr_vec - target_center) ** 2
+        # L2-normalize: align DIRECTION with center, not magnitude
+        repr_norm = repr_vec / (torch.norm(repr_vec) + 1e-8)
+        L_feat = torch.norm(repr_norm - target_center) ** 2
 
-        # ---- 2. Center distance ----
-        L_center = torch.norm(repr_vec - target_center)
+        # ---- 2. Center distance (on normalized vectors) ----
+        L_center = torch.norm(repr_norm - target_center)
 
         # ---- 3. LPIPS: optimize vs FREQ-FILTERED ref (no trigger!) ----
         x_lpips_opt = self._prep_lpips(x_c)
@@ -169,8 +171,9 @@ class FeatureReconstructor:
         x_n = (x_c - self.mean) / self.std
 
         feats = self.model.extract_with_grad(x_n)
-        L_feat = torch.norm(feats - target_center) ** 2
-        L_center = torch.norm(feats - target_center)
+        feats_norm = feats / (torch.norm(feats) + 1e-8)
+        L_feat = torch.norm(feats_norm - target_center) ** 2
+        L_center = torch.norm(feats_norm - target_center)
 
         mask_c = mask.repeat(1, C, 1, 1)
         L_pix = ((x_c - x_ref).abs() * mask_c).mean()

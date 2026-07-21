@@ -39,7 +39,7 @@ class PipelineConfig:
     model_epochs_poisoned: int = 15
     batch_size: int = 128
     backbone: str = 'mobilenet'
-    use_logits_space: bool = True        # centers/distances in logits (10-dim)
+    use_logits_space: bool = False        # centers/distances in features (256-dim)
                                           # instead of raw features (256-dim)
 
     # ================================================================
@@ -84,7 +84,7 @@ class PipelineConfig:
     # EM Iteration (Module 4) — FIXED INIT
     # ================================================================
     em_max_iter: int = 8
-    em_conv_threshold: float = 0.02
+    em_conv_threshold: float = 0.005
     em_init_mode: str = 'nearest'
     opt_steps_coarse: int = 100           # per-EM-iter coarse Adam steps
     opt_steps_fine: int = 200             # per-EM-iter fine Adam steps
@@ -101,14 +101,14 @@ class PipelineConfig:
     # Sampling
     # ================================================================
     n_clean_per_class: int = 200
-    n_demo_samples: int = 6
-    n_poisoned_total: int = 60
+    n_demo_samples: int = 60
+    n_poisoned_total: int = 200
 
     # ================================================================
     # Evaluation — BASELINE FIXES
     # ================================================================
-    ft_epochs: int = 10                   # was hardcoded 5 in baselines
-    ft_lr: float = 0.0005                 # was hardcoded 0.0001
+    ft_epochs: int = 30                   # was 10 (too few to unlearn backdoor bias)
+    ft_lr: float = 0.001                  # was 0.0005 (too small to reset classifier)
     eval_seed: int = 42
 
     # ================================================================
@@ -138,6 +138,14 @@ class PipelineConfig:
         }
         dir_name = attack_dir_map.get(self.attack, f'images_{self.attack}')
         self.pois_dir = os.path.join(self.data_root, ds_upper, dir_name)
+
+        # Excel path: attack-aware (different image filenames per attack)
+        excel_map = {
+            'badnets': 'train_badnets.xlsx',
+            'blended': 'train1.xlsx',
+        }
+        excel_name = excel_map.get(self.attack, 'train1.xlsx')
+        self.excel_path = os.path.join(r'D:\deephash_original\data', ds_upper, excel_name)
         self.exp_dir = os.path.join(
             self.output_root, f'{self.dataset}_{self.attack}_{self.timestamp}')
         self.stage_dir = os.path.join(self.exp_dir, 'stages')

@@ -54,23 +54,31 @@ class FrequencyFilter:
 
         Uses median + MAD for robustness to outliers, plus percentile thresholds
         for adaptive anomaly detection.
+
+        Now backbone-aware: resizes images to match the pipeline's input size
+        (224 for MobileNetV3/ResNet18, native img_size for CNN).
         """
         from PIL import Image
         rng = np.random.RandomState(self.cfg.seed)
         n_baseline = min(self.cfg.n_freq_baseline, len(clean_files))
         idxs = rng.choice(len(clean_files), n_baseline, replace=False)
 
-        # Read first image to determine shape
+        # Determine target size: must match what the pipeline feeds us
+        backbone = getattr(self.cfg, 'backbone', 'mobilenet')
+        target_size = 224 if backbone in ('resnet18', 'mobilenet') else self.cfg.img_size
+
+        # Read first image + resize to determine shape
         sample = np.array(Image.open(
-            f'{clean_dir}/{clean_files[idxs[0]]}').convert('RGB')).astype(np.float32) / 255.0
+            f'{clean_dir}/{clean_files[idxs[0]]}').convert('RGB')
+            .resize((target_size, target_size))).astype(np.float32) / 255.0
         C = sample.shape[2] if sample.ndim == 3 else 1
         H, W = sample.shape[0], sample.shape[1]
 
-        # Collect per-channel FFT magnitudes
+        # Collect per-channel FFT/DCT magnitudes
         if self.method == 'dct':
-            all_mags = self._collect_dct_mags(clean_files, clean_dir, idxs, C, H, W)
+            all_mags = self._collect_dct_mags(clean_files, clean_dir, idxs, C, H, W, target_size)
         else:
-            all_mags = self._collect_fft_mags(clean_files, clean_dir, idxs, C, H, W)
+            all_mags = self._collect_fft_mags(clean_files, clean_dir, idxs, C, H, W, target_size)
 
         # Robust statistics: median and MAD
         self.mu = np.median(all_mags, axis=0)           # [C, H, W]
@@ -81,25 +89,27 @@ class FrequencyFilter:
 
         print(f"  Frequency baseline: {n_baseline} images, method={self.method}, "
               f"z_thr={self.z_thr}, attenuation={self.attenuation}, "
-              f"percentile={self.percentile}")
+              f"percentile={self.percentile}, size={target_size}×{target_size}")
         return self
 
-    def _collect_fft_mags(self, clean_files, clean_dir, idxs, C, H, W):
-        """Collect per-channel FFT magnitudes."""
+    def _collect_fft_mags(self, clean_files, clean_dir, idxs, C, H, W, target_size):
+        """Collect per-channel FFT magnitudes, resizing images to target_size."""
         all_mags = np.zeros((len(idxs), C, H, W), dtype=np.float32)
         for i, idx in enumerate(idxs):
             img = np.array(Image.open(
-                f'{clean_dir}/{clean_files[idx]}').convert('RGB')).astype(np.float32) / 255.0
+                f'{clean_dir}/{clean_files[idx]}').convert('RGB')
+                .resize((target_size, target_size))).astype(np.float32) / 255.0
             for c in range(C):
                 all_mags[i, c] = np.abs(np.fft.fft2(img[:, :, c]))
         return all_mags
 
-    def _collect_dct_mags(self, clean_files, clean_dir, idxs, C, H, W):
-        """Collect per-channel DCT magnitudes."""
+    def _collect_dct_mags(self, clean_files, clean_dir, idxs, C, H, W, target_size):
+        """Collect per-channel DCT magnitudes, resizing images to target_size."""
         all_mags = np.zeros((len(idxs), C, H, W), dtype=np.float32)
         for i, idx in enumerate(idxs):
             img = np.array(Image.open(
-                f'{clean_dir}/{clean_files[idx]}').convert('RGB')).astype(np.float32) / 255.0
+                f'{clean_dir}/{clean_files[idx]}').convert('RGB')
+                .resize((target_size, target_size))).astype(np.float32) / 255.0
             for c in range(C):
                 all_mags[i, c] = np.abs(fft.dct(fft.dct(img[:, :, c].T, norm='ortho').T, norm='ortho'))
         return all_mags

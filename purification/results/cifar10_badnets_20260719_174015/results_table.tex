@@ -1,0 +1,16 @@
+\begin{table}[htbp]
+\centering
+\caption{Comparison of defense methods on \texttt{cifar10} (badnets attack).}
+\label{tab:results}
+\begin{tabular}{lccc}
+\toprule
+Method & CA (\%) & DR (\%) & Notes \\
+\midrule
+  No Defense & 81.9 & 100.0 & poisoned model, no purification \\
+  Direct Removal & 88.5 & 98.7 & Direct Removal \\
+  Fine-Tuning & 32.5 & 100.0 & Fine-Tuning \\
+  Ours (Purification) & 10.2 & 100.0 & Purification + retrain (6 purified + 2000 clean) \\
+  NAD & 12.9 & 100.0 & NAD (simplified) \\
+\bottomrule
+\end{tabular}
+\end{table}

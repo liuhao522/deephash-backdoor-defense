@@ -47,7 +47,7 @@ class LabelCalibrator:
     # Main calibration
     # ================================================================
     def calibrate(self, features: np.ndarray) -> Tuple[int, float, Dict]:
-        """Assign label and compute confidence.
+        """Assign label and compute confidence using cosine distance.
 
         Args:
             features: [feat_dim] — feature vector of purified image
@@ -55,9 +55,11 @@ class LabelCalibrator:
         Returns:
             (assigned_label, confidence, diagnostics_dict)
         """
-        # Distances to all centers
+        # Cosine distances to all centers (scale-invariant)
+        fn = features / (np.linalg.norm(features) + 1e-8)
         dists = np.array([
-            float(np.linalg.norm(features - self.centers[k]))
+            float(1.0 - np.dot(fn, self.centers[k] /
+                   (np.linalg.norm(self.centers[k]) + 1e-8)))
             for k in range(self.cfg.num_classes)
         ])
 

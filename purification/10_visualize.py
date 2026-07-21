@@ -24,7 +24,7 @@ class Visualizer:
         t = t.cpu() * torch.tensor(self.cfg.std).view(-1,1,1) + torch.tensor(self.cfg.mean).view(-1,1,1)
         t = t.clamp(0, 1)
         if t.size(0) == 1: t = t.repeat(3,1,1)
-        return t.permute(1,2,0).numpy()
+        return t.detach().permute(1,2,0).numpy()
 
     def per_stage_grid(self, diag, idx):
         """Fig 1: Per-stage image evolution with metrics."""
