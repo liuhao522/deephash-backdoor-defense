@@ -811,7 +811,7 @@ class PurificationPipeline:
         for i in range(n_purified, len(self.data['pois_f_sub'])):
             fname = self.data['pois_f_sub'][i]
             tl = self.data['pois_l_sub'][i]
-            img = transforms.ToTensor()(
+            img = self.img_transform_raw(
                 Image.open(os.path.join(self.cfg.pois_dir, fname)).convert('RGB'))
             samples.append((img, tl))
 

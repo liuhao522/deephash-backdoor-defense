@@ -1,0 +1,16 @@
+\begin{table}[htbp]
+\centering
+\caption{Comparison of defense methods on \texttt{cifar10} (blended attack).}
+\label{tab:results}
+\begin{tabular}{lccc}
+\toprule
+Method & CA (\%) & DR (\%) & Notes \\
+\midrule
+  No Defense & 86.8 & 100.0 & poisoned model, no purification \\
+  Direct Removal & 87.5 & 95.8 & Direct Removal \\
+  Fine-Tuning & 86.3 & 100.0 & Fine-Tuning \\
+  Ours (Purification) & 83.1 & 100.0 & Purification + retrain (200 purified + 4540 clean) \\
+  NAD & 82.0 & 100.0 & NAD (simplified) \\
+\bottomrule
+\end{tabular}
+\end{table}
