@@ -181,7 +181,7 @@ def main():
                 transforms.Normalize(config.mean, config.std)
             ])
         cifar_test = datasets.CIFAR10(
-            root='./data', train=False, download=True,
+            root=r'D:\deephash_original\data', train=False, download=False,
             transform=test_tf)
         test_loader = DataLoader(
             cifar_test, batch_size=config.batch_size, shuffle=False)

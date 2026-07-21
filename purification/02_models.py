@@ -100,11 +100,10 @@ class FeatureExtractor(nn.Module):
         out = F.relu(self.block3(out))
         out = self.pool3(out)
         out = F.relu(self.block4(out))
-        out = self.avgpool(out).flatten(1)
-        # Raw Linear output (no ReLU) → signed features for cosine distance
-        feat_raw = self.fc[0](out)         # [0]=Linear(256,feat_dim)
+        out = self.avgpool(out).flatten(1)  # [B, 256] CNN backbone features
         if return_feat:
-            return feat_raw                 # ± values, full cosine range [0,2]
+            return out                      # backbone features (256-dim), well-separated
+        feat_raw = self.fc[0](out)         # [0]=Linear(256,feat_dim)
         feat = F.relu(feat_raw)             # ReLU for classification path
         feat = self.fc[1](feat)             # [1]=ReLU
         feat = self.fc[2](feat)             # [2]=Dropout
@@ -148,10 +147,10 @@ class ResNet18Extractor(nn.Module):
         _disable_inplace(self)
 
     def forward(self, x, return_feat=False):
-        f = self.features(x).flatten(1)
-        feat_raw = self.fc[0](f)          # [0]=Linear(512,256) — no ReLU
+        f = self.features(x).flatten(1)    # [B, 512] backbone features
         if return_feat:
-            return feat_raw                # ± values, full cosine range [0,2]
+            return f                        # backbone features (512-dim), well-separated
+        feat_raw = self.fc[0](f)           # [0]=Linear(512,256) — no ReLU
         feat = F.relu(feat_raw)            # ReLU for classification path
         feat = self.fc[1](feat)            # [1]=ReLU
         feat = self.fc[2](feat)            # [2]=Dropout
@@ -187,10 +186,10 @@ class MobileNetV3Extractor(nn.Module):
 
     def forward(self, x, return_feat=False):
         f = self.features(x)
-        f = self.avgpool(f).flatten(1)
-        feat_raw = self.proj[0](f)         # [0]=Linear(576,256) — no ReLU
+        f = self.avgpool(f).flatten(1)     # [B, 576] backbone features
         if return_feat:
-            return feat_raw                 # ± values, full cosine range [0,2]
+            return f                        # backbone features (576-dim), well-separated
+        feat_raw = self.proj[0](f)         # [0]=Linear(576,256) — no ReLU
         feat = F.relu(feat_raw)             # ReLU for classification path
         feat = self.proj[1](feat)           # [1]=ReLU
         feat = self.proj[2](feat)           # [2]=Dropout

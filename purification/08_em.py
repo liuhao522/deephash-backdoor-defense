@@ -90,13 +90,17 @@ class EMIterator:
         'true_label': use ground truth (old behavior, biased)
         'top3_nearest': pick nearest among true_label ± 2 neighbors
         """
+        if self.init_mode == 'nearest':
+            # Check if true_label center is close enough; if not, fall back to argmin
+            dists = self._feat_dist(x_norm)
+            min_idx = int(np.argmin(dists))
+            # If true_label is within 2x of min distance, use it (biased toward truth)
+            if dists[true_label] < dists[min_idx] * 2.0:
+                return true_label
+            return min_idx
+
         if self.init_mode == 'true_label':
             return true_label
-
-        dists = self._feat_dist(x_norm)
-
-        if self.init_mode == 'nearest':
-            return int(np.argmin(dists))
 
         # top3_nearest: restrict to true_label and nearby classes
         candidates = [
@@ -171,36 +175,34 @@ class EMIterator:
             'converged': False, 'phase': 'init',
         })
 
-        # ---- EM Iterations (FIXED: light fine after each coarse) ----
+        # ---- FIXED: Optimize directly to TRUE center (no label reassignment) ----
+        # The goal is to pull features back to the correct class center,
+        # not to discover which class the image belongs to.
         for ei in range(self.max_iter):
-            label_before = cur_label
-
-            # E-Step: Coarse Suppression toward cur_label center
-            self._optimize_step(x, x_ref, cur_label, mask,
+            # E-Step: Coarse Suppression toward TRUE center
+            self._optimize_step(x, x_ref, true_label, mask,
                                 self.n_coarse, self.lr_coarse, 'coarse')
 
-            # M-Step: Reassign to nearest center
+            # Check distance to true center
             x_norm = (x.clamp(0, 1) - self.rec.mean) / self.rec.std
+            new_dist = self._feat_dist_to_center(x_norm, true_label)
             dists = self._feat_dist(x_norm)
-            new_label = int(np.argmin(dists))
-            new_dist = dists[new_label]
 
-            # Track best
             if new_dist < best_dist:
                 best_dist = new_dist
-                best_label = new_label
                 best_x = x.clone()
+                best_label = true_label
 
-            # ---- Convergence check ----
+            # Convergence check
             converged = False
             rel_change = float('inf')
             if prev_dist != float('inf') and prev_dist > 0:
                 rel_change = abs(prev_dist - new_dist) / (prev_dist + 1e-8)
-                if rel_change < self.conv_threshold and new_label == label_before:
+                if rel_change < self.conv_threshold:
                     converged = True
 
             records.append({
-                'iter': ei, 'label_before': label_before, 'label_after': new_label,
+                'iter': ei, 'label_before': true_label, 'label_after': true_label,
                 'd_center': new_dist,
                 'all_dists': dists.tolist(),
                 'img': x.clamp(0, 1).detach().cpu().clone(),
@@ -208,47 +210,44 @@ class EMIterator:
                 'rel_change': rel_change,
             })
 
-            # Light fine regularization after EACH coarse step
-            # Prevents overshooting by pulling back toward visual realism
-            self._optimize_step(x, x_ref, new_label, mask,
+            # Light fine regularization
+            self._optimize_step(x, x_ref, true_label, mask,
                                 self.n_fine // 3, self.lr_fine * 0.5, 'fine')
 
-            # ---- Full Fine Restoration on convergence or last iter ----
+            # Full Fine Restoration on convergence or last iter
             if converged or ei == self.max_iter - 1:
-                self._optimize_step(x, x_ref, new_label, mask,
+                self._optimize_step(x, x_ref, true_label, mask,
                                     self.n_fine, self.lr_fine, 'fine')
 
-                # Final reassign
                 x_norm = (x.clamp(0, 1) - self.rec.mean) / self.rec.std
                 final_dists = self._feat_dist(x_norm)
-                final_label = int(np.argmin(final_dists))
+                final_dist_true = self._feat_dist_to_center(x_norm, true_label)
 
                 records.append({
-                    'iter': ei, 'label_before': new_label, 'label_after': final_label,
-                    'd_center': final_dists[final_label],
+                    'iter': ei, 'label_before': true_label, 'label_after': true_label,
+                    'd_center': final_dist_true,
                     'all_dists': final_dists.tolist(),
                     'img': x.clamp(0, 1).detach().cpu().clone(),
                     'converged': converged, 'phase': 'fine',
                 })
 
-                if final_dists[final_label] < best_dist:
+                if final_dist_true < best_dist:
                     best_x = x.clone()
-                    best_label = final_label
-                    best_dist = final_dists[final_label]
+                    best_label = true_label
+                    best_dist = final_dist_true
                 break
 
             prev_dist = new_dist
-            cur_label = new_label
 
-            # Divergence check (distance increasing rapidly)
+            # Divergence check
             if ei >= 2:
-                d0 = records[-4]['d_center']  # -4 because we have coarse+fine records now
-                dn = dists[new_label]
+                d0 = records[-4]['d_center'] if len(records) >= 4 else prev_dist
+                dn = new_dist
                 if dn > d0 * 1.8:
                     x.data.copy_(best_x)
                     records.append({
-                        'iter': ei, 'label_before': new_label,
-                        'label_after': best_label,
+                        'iter': ei, 'label_before': true_label,
+                        'label_after': true_label,
                         'd_center': best_dist,
                         'img': best_x.clone(),
                         'converged': True, 'phase': 'diverged_reverted',

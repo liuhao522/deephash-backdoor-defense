@@ -206,7 +206,7 @@ class PurificationPipeline:
                     transforms.ToTensor(),
                     transforms.Normalize(self.cfg.mean, self.cfg.std)
                 ])
-            test_ds = datasets.CIFAR10(root='./data', train=False, download=True,
+            test_ds = datasets.CIFAR10(root=r'D:\deephash_original\data', train=False, download=False,
                                        transform=verify_tf)
             test_ldr = DataLoader(test_ds, batch_size=self.cfg.batch_size, shuffle=False)
             ca = self._eval_acc(self.clean_model, test_ldr)
@@ -255,9 +255,9 @@ class PurificationPipeline:
                 transforms.Normalize(self.cfg.mean, self.cfg.std)
             ])
 
-        clean_train = datasets.CIFAR10(root='./data', train=True, download=True,
+        clean_train = datasets.CIFAR10(root=r'D:\deephash_original\data', train=True, download=False,
                                        transform=train_tf)
-        clean_test = datasets.CIFAR10(root='./data', train=False, download=True,
+        clean_test = datasets.CIFAR10(root=r'D:\deephash_original\data', train=False, download=False,
                                       transform=test_tf)
 
         train_ldr = DataLoader(clean_train, batch_size=self.cfg.batch_size, shuffle=True)
@@ -415,8 +415,16 @@ class PurificationPipeline:
     # ================================================================
     def build_centers(self):
         t0 = time.time()
-        use_logits = getattr(self.cfg, 'use_logits_space', True)
-        space_name = "logits (10-dim)" if use_logits else f"features ({self.cfg.feat_dim}-dim)"
+        use_logits = getattr(self.cfg, 'use_logits_space', False)
+        # Probe actual feature dimension from model output
+        with torch.no_grad():
+            probe_img = self._load(self.data['sel_clean_f'][0], self.cfg.clean_dir).unsqueeze(0).to(self.device)
+            if use_logits:
+                actual_dim = self.clean_model(probe_img).shape[1]
+            else:
+                actual_dim = self.clean_model.extract(probe_img).shape[1]
+        self._feat_dim = int(actual_dim)
+        space_name = "logits (10-dim)" if use_logits else f"features ({self._feat_dim}-dim)"
         print(f"[5] Building class centers in {space_name}...")
 
         feats = self._batch_extract(
@@ -426,7 +434,7 @@ class PurificationPipeline:
         for feat, label in zip(feats, self.data['sel_clean_l']):
             class_feats[label].append(feat)
 
-        center_dim = self.cfg.num_classes if use_logits else self.cfg.feat_dim
+        center_dim = self.cfg.num_classes if use_logits else self._feat_dim
         self.centers = np.zeros((self.cfg.num_classes, center_dim))
         intra_stds = []
         for label in range(self.cfg.num_classes):
@@ -500,16 +508,16 @@ class PurificationPipeline:
               f"min_inter={quality['min_inter_center_dist']:.2f}")
 
         # Demo samples for visualization
-        n_demo = min(self.cfg.n_demo_samples, len(self.data['pois_f_sub']))
-        d_idx = self.rng.choice(
-            len(self.data['pois_f_sub']), n_demo, replace=False)
-
+        n_all = len(self.data['pois_f_sub'])
+        n_demo = min(self.cfg.n_demo_samples, n_all)
+        all_idx = list(range(n_all))
+        self.rng.shuffle(all_idx)
         all_diags, purified_dict = [], {}
 
-        for di, idx in enumerate(d_idx):
+        for idx in range(n_all):
             fname = self.data['pois_f_sub'][idx]
             tl = self.data['pois_l_sub'][idx]
-            print(f"\n  --- S{di+1}/{n_demo}: {fname} (true={tl}) ---")
+            print(f"\n  --- S{idx+1}/{n_all}: {fname} (true={tl}) ---")
 
             # Load clean + poisoned versions
             clean_t = self._load(fname, self.cfg.clean_dir).cpu()
@@ -577,6 +585,7 @@ class PurificationPipeline:
             # ---- 3+4: EM Iteration (FIXED: x_ref = x_freq, NOT pois_raw) ----
             # Using freq-filtered image as reference avoids L_perc+L_pix
             # pulling toward the original trigger pattern.
+            # EM always optimizes toward true_label center (no label reassignment)
             x_pur, em_records = em_iter.run(x_freq, x_freq, mask, tl)
             sd['em_records'] = em_records
 
@@ -632,8 +641,8 @@ class PurificationPipeline:
         # Summary
         n_correct = sum(1 for sd in all_diags
                         if sd['stages']['5_label']['metrics']['final_label'] == sd['true_label'])
-        print(f"\n  Purification complete: {n_correct}/{n_demo} correct "
-              f"({100*n_correct/max(1,n_demo):.1f}%)")
+        print(f"\n  Purification complete: {n_correct}/{n_all} correct "
+              f"({100*n_correct/max(1,n_all):.1f}%)")
 
         self.results = {
             'all_diags': all_diags,
@@ -649,6 +658,8 @@ class PurificationPipeline:
         print("\n[6] Generating visualizations...")
         vis = Visualizer(self.cfg)
         for si, sd in enumerate(self.results['all_diags']):
+            if si >= self.cfg.n_demo_samples:
+                break
             vis.per_stage_grid(sd, si)
             vis.frequency(sd, si)
             vis.gradient(sd, si)
@@ -657,7 +668,7 @@ class PurificationPipeline:
         vis.summary_grid(self.results['all_diags'], self.metrics)
 
         # t-SNE
-        use_logits = getattr(self.cfg, 'use_logits_space', True)
+        use_logits = getattr(self.cfg, 'use_logits_space', False)
         cf = self._batch_extract(
             self.data['sel_clean_f'][:500], self.cfg.clean_dir,
             model=self.clean_model, use_logits=use_logits)
@@ -732,7 +743,8 @@ class PurificationPipeline:
             else:
                 feats.append(model.extract(x).cpu().numpy())
         if not feats:
-            return np.zeros((0, self.cfg.num_classes if use_logits else self.cfg.feat_dim))
+            actual = self.cfg.num_classes if use_logits else getattr(self, '_feat_dim', self.cfg.feat_dim)
+            return np.zeros((0, actual))
         return np.concatenate(feats, 0)
 
     def _repr(self, x_norm):

@@ -204,7 +204,7 @@ class BaselineFineTuning:
         opt = optim.Adam(ft_model.parameters(), lr=lr)
         sch = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
-        for ep in range(epochs - 2):
+        for ep in range(epochs):
             for x, y in loader:
                 x, y = x.to(self.device), y.to(self.device)
                 opt.zero_grad()

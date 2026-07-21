@@ -35,6 +35,7 @@ class FeatureReconstructor:
     """
 
     def __init__(self, model, patchgan, lpips_fn, config, mean_t, std_t):
+        self._anchor_center = None
         self.model = model
         self.patchgan = patchgan
         self.lpips_fn = lpips_fn
@@ -51,6 +52,9 @@ class FeatureReconstructor:
         self.w_adv = config.lambda_adv
         self.w_pix = config.lambda_pix
         self.w_tv = config.lambda_tv
+
+    def set_anchor_center(self, center):
+        self._anchor_center = center
 
     # ================================================================
     # LPIPS preprocessing
